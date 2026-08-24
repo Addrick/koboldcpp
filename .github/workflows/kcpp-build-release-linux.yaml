@@ -8,6 +8,11 @@ on:
         required: false
         default: ''
 
+  # fork-only (DP-326): build the deploy branch on push. Must never be
+  # carried onto feat/* or into an upstream PR.
+  push:
+    branches: [deploy]
+
 env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   KCPP_CUDA: 12.1.0
