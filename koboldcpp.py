@@ -2131,6 +2131,9 @@ def load_model(model_filename):
     if scgrid>0 and scint>0:
         print("Note: --smartcachegrid is set, so --smartcache is ignored. They are separate modes: "
               "--smartcache swaps between conversations, --smartcachegrid checkpoints one deep context.")
+    if scgrid>0 and args.smartcachemb and args.smartcachemb>0:
+        print("Note: --smartcachegrid is already a memory budget in MB, so --smartcachemb is ignored. "
+              "--smartcachemb bounds the conversation-swap path only.")
     inputs.smartcache = True if (scint>0 or scgrid>0) else False
     sclimit = (savestate_limit_default if scint<=1 else scint)
     savestate_limit = sclimit
@@ -12864,7 +12867,7 @@ if __name__ == '__main__':
     advparser.add_argument("--singleinstance", help="Allows this KoboldCpp instance to be shut down by any new instance requesting the same port, preventing duplicate servers from clashing on a port.", action='store_true')
     advparser.add_argument("--smartcache", help="Enables intelligent context switching by saving KV cache snapshots to RAM. Requires fast forwarding.", metavar=('limit'), nargs='?', const=1, type=int, default=0)
     advparser.add_argument("--smartcachemb", help="Caps total SmartCache savestate memory in MB. Slots are evicted oldest-first until an incoming snapshot fits. 0 = unlimited (default, current behavior).", metavar=('[megabytes]'), type=int, default=0)
-    advparser.add_argument("--smartcachegrid", help="Places SmartCache checkpoints on an absolute token-depth grid every N tokens, instead of a single prompt-relative lifeboat. Helps recurrent/hybrid models on edit-and-retry. 0 = disabled (default, current behavior).", metavar=('[tokens]'), type=int, default=0)
+    advparser.add_argument("--smartcachegrid", help="Enables the SmartCache checkpoint grid with a memory budget in MB. Checkpoints are placed at absolute token depths and kept at a density that falls off with distance back from the head, fitting as many as the budget allows. Helps recurrent/hybrid models on edit-and-retry. 0 = disabled (default, current behavior).", metavar=('[megabytes]'), type=int, default=0)
     advparser.add_argument("--smartcontext", help="Reserving a portion of context to try processing less frequently. Outdated. Not recommended.", action='store_true')
     advparser.add_argument("--splitmode","-sm","--split-mode", help="How to split the model across multiple GPUs", metavar=('[split mode]'), type=str, choices=splitmode_choices, default=splitmode_choices[0])
     advparser.add_argument("--ssl", help="Allows all content to be served over SSL instead. A valid UNENCRYPTED SSL cert and key .pem files must be provided", metavar=('[cert_pem]', '[key_pem]'), nargs='+')
