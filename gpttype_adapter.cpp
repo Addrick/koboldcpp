@@ -179,6 +179,7 @@ static int rnn_lifeboat_slot_idx = -1;
 static int rnn_boundary_slot_idx = -1; //grid mode: reserved slot for the prompt_end-32 rung
 static bool rnn_lifeboat_hard_reserved = false;
 static bool smartcache_grid_mode = false; //the grid owns the slot array; no swap slots, no lifeboat
+static int smartcache_protected_slot = -1; //a slot the byte budget must not evict - a load is about to read it
 static std::string overridden_jinja_template = ""; //if set, overrides jinja template
 
 static int delayed_generated_tokens_limit = 0;
@@ -5612,13 +5613,13 @@ static int smartcache_grid_snapshot()
         gpttype_save_state_kv(nearby_slot);
         return nearby_slot;
     }
-    int victim = get_evictable_slot(rnn_reusable_slot_idx,rnn_boundary_slot_idx);
-    if(victim==-1)
+    int target = get_target_slot(rnn_reusable_slot_idx,rnn_boundary_slot_idx);
+    if(target==-1)
     {
         return -1; //no slot this write is allowed to take - skip the grid point rather than clobber the head
     }
-    gpttype_save_state_kv(victim);
-    return victim;
+    gpttype_save_state_kv(target);
+    return target;
 }
 
 int smartcache_quick_snapshot(int specific_slot = -1)
@@ -6292,7 +6293,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             if(identical_slot==-1)
                             {
                                 printf("\n[SmartCache RNN Match of %d tokens in slot %d. Saving into slot %d and switching...]\n",bestlen,bestslot,oldest_slot);
+                                //this save may evict to fit the budget; it must not free the state we are about to load
+                                smartcache_protected_slot = bestslot;
                                 gpttype_save_state_kv(oldest_slot);
+                                smartcache_protected_slot = -1;
                             } else {
                                 printf("\n[SmartCache RNN Match of %d tokens in slot %d. Already saved in slot %d, switching...]\n",bestlen,bestslot,identical_slot);
                                 touch_slot(identical_slot);
@@ -7618,11 +7622,15 @@ size_t gpttype_save_state_kv(int slot)
         while(smartcache_budget_bytes > 0 && total_savestate_bytes + newsize > smartcache_budget_bytes)
         {
             int victim = get_evictable_slot(slot,-1);
-            if(victim==-1 || savestates[victim].current_savestate_buffer.empty())
+            if(victim==-1)
             {
-                break; //nothing left that may be freed - allocate anyway rather than fail the request
+                //nothing left that may be freed - allocate anyway rather than fail the request
+                printf("\nSmartCache: over budget (%zu MB + %zu MB > %zu MB) and nothing evictable.\n",
+                       total_savestate_bytes/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
+                break;
             }
-            printf("\nSmartCache: over budget, evicting slot %d.",victim);
+            printf("\nSmartCache: over budget, evicting slot %d (%zu MB held, %zu MB incoming, %zu MB cap).\n",
+                   victim,total_savestate_bytes/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
             free_savestate_slot(victim, true);
         }
         try {
@@ -7796,10 +7804,10 @@ int get_identical_existing_slot() //returns slot number of slot containing exact
     return slotid;
 }
 
-//Like get_oldest_slot, but only ever returns a slot that actually holds something, and
-//returns -1 when there is no legal victim. get_oldest_slot's 0 default is a phantom victim
-//and cannot be looped on; this is the version the byte-budget and grid paths use.
-int get_evictable_slot(int excludeSlotA, int excludeSlotB)
+//WHERE DO I WRITE? An empty slot if there is one, otherwise the oldest. Never a reserved
+//slot. Returns -1 only if every slot is reserved. Unlike get_oldest_slot, whose 0 default is
+//a phantom victim, -1 here means "there is nowhere legal to put this".
+int get_target_slot(int excludeSlotA, int excludeSlotB)
 {
     int64_t slotage = INT64_MAX;
     int slotid = -1;
@@ -7810,13 +7818,51 @@ int get_evictable_slot(int excludeSlotA, int excludeSlotB)
         {
             continue;
         }
-        if(savestates[i].current_savestate_buffer.empty()) //free slot - take it before evicting anything
+        if(savestates[i].current_savestate_buffer.empty()) //free slot - take it before overwriting anything
         {
             return i;
         }
         if(savestates[i].last_used <= slotage)
         {
             slotage = savestates[i].last_used;
+            slotid = i;
+        }
+    }
+    return slotid;
+}
+
+//WHAT MAY I FREE? The oldest slot that actually holds bytes. An empty slot is not a victim -
+//freeing it releases nothing - so this must not be confused with get_target_slot above, which
+//prefers exactly that. Returns -1 when nothing may be freed, so a budget loop can terminate.
+int get_evictable_slot(int excludeSlotA, int excludeSlotB)
+{
+    int64_t slotage = INT64_MAX;
+    int slotid = -1;
+    for(int i=0;i<savestate_limit;++i)
+    {
+        //the two per-turn reserved slots are never victims: the head checkpoint is what makes a
+        //retry cost 0 tokens and the boundary rung caps a retokenized tail at 32, so trading
+        //either away to store one more grid point is a bad deal at any budget
+        if(i==excludeSlotA || i==excludeSlotB
+           || i==rnn_reusable_slot_idx || i==rnn_boundary_slot_idx
+           || i==smartcache_protected_slot
+           || (rnn_lifeboat_hard_reserved && i==rnn_lifeboat_slot_idx))
+        {
+            continue;
+        }
+        if(savestates[i].current_savestate_buffer.empty()) //nothing to reclaim here
+        {
+            continue;
+        }
+        //In grid mode, recency is not a meaningful ordering: every grid point is re-derivable, and
+        //a cold prefill writes all of them inside the same second, so last_used ties across the
+        //whole grid and the victim would be arbitrary. Depth is the real ordering - drop the
+        //shallowest, because an edit lands in the tail and is served by the deepest point below it.
+        int64_t rank = (smartcache_grid_mode ? (int64_t)savestates[i].savestate_context_tokens.size()
+                                             : savestates[i].last_used);
+        if(rank < slotage || slotid==-1)
+        {
+            slotage = rank;
             slotid = i;
         }
     }

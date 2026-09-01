@@ -152,5 +152,6 @@ bool gpttype_clear_state_kv(bool shrink);
 int get_oldest_slot(int excludeSlotId);
 void touch_slot(int slot);
 int get_identical_existing_slot();
-int get_evictable_slot(int excludeSlotA, int excludeSlotB); //oldest non-empty slot, or -1 if there is no real victim
+int get_target_slot(int excludeSlotA, int excludeSlotB);    //where to write: free slot, else oldest
+int get_evictable_slot(int excludeSlotA, int excludeSlotB); //what to free: oldest NON-EMPTY slot, or -1
 void free_savestate_slot(int slot, bool shrink);
