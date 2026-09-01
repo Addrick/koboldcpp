@@ -176,7 +176,9 @@ static bool showed_rnn_warning = false;
 static bool highpriority = false;
 static int rnn_reusable_slot_idx = -1;
 static int rnn_lifeboat_slot_idx = -1;
+static int rnn_boundary_slot_idx = -1; //grid mode: reserved slot for the prompt_end-32 rung
 static bool rnn_lifeboat_hard_reserved = false;
+static bool smartcache_grid_mode = false; //the grid owns the slot array; no swap slots, no lifeboat
 static std::string overridden_jinja_template = ""; //if set, overrides jinja template
 
 static int delayed_generated_tokens_limit = 0;
@@ -3576,20 +3578,35 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         savestate_limit = inputs.smartcacheslots;
         rnn_reusable_slot_idx = -1;
         rnn_lifeboat_slot_idx = -1;
+        rnn_boundary_slot_idx = -1;
         rnn_lifeboat_hard_reserved = false;
+        smartcache_grid_mode = false;
 
         //if RNN model AND shifting and fastforward is on, enable smartcache
         if((llama_model_is_recurrent(llamamodel) || llama_model_is_hybrid(llamamodel)) && kcpp_data->use_fastforward && kcpp_data->use_contextshift)
         {
-            if(savestate_limit>0)
+            if(inputs.smartcachegrid > 0)
+            {
+                //Grid mode. --smartcache serves swapping between conversations; the grid serves
+                //edit-and-retry within one deep context. They are separate features with separate
+                //slot economies, so the grid does not borrow from the swap pool - it owns the array.
+                //(Running a grid per conversation would be a layering of the two; not implemented.)
+                smartcache_grid_mode = true;
+                kcpp_data->smartcache = true;
+                int gridspacing = (inputs.smartcachegrid < smartcache_grid_min_spacing ? smartcache_grid_min_spacing : inputs.smartcachegrid);
+                savestate_limit = (kcpp_data->n_ctx + gridspacing - 1) / gridspacing; //a ceiling; bytes are the real bound
+                savestate_limit += 1;
+                rnn_reusable_slot_idx = savestate_limit - 1;   //head checkpoint, keeps retries at 0 tokens
+                savestate_limit += 1;
+                rnn_boundary_slot_idx = savestate_limit - 1;   //prompt_end-32 rung, keeps a retokenized tail at 32
+            }
+            else if(savestate_limit>0)
             {
                 printf("RNN or Hyrbid model with FF and shifting flags enabled - SmartCache will be enabled with extra slots. Disable CtxShift if you do not want this.\n",savestate_limit);
                 kcpp_data->smartcache = true;
                 savestate_limit += 1;
                 rnn_reusable_slot_idx = savestate_limit - 1;
-                //the grid supersedes the lifeboat, so do not reserve a slot for it - a
-                //hard-reserved slot no write site can reach is a slot permanently lost
-                if(inputs.smartcacheslots >= smartcache_rnn_lifeboat_extra_slot_min_user_slots && inputs.smartcachegrid <= 0)
+                if(inputs.smartcacheslots >= smartcache_rnn_lifeboat_extra_slot_min_user_slots)
                 {
                     savestate_limit += 1;
                     rnn_lifeboat_slot_idx = savestate_limit - 1;
@@ -3613,9 +3630,15 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             {
                 printf("SmartCache: Memory budget %zu MB, oldest slots evicted to fit.\n",smartcache_budget_bytes/(1024*1024));
             }
-            if(smartcache_grid_spacing>0)
+            if(smartcache_grid_mode)
             {
-                printf("SmartCache: Checkpoint grid every %d tokens of absolute depth (supersedes the RNN lifeboat).\n",smartcache_grid_spacing);
+                printf("SmartCache: GRID MODE - checkpoints every %d tokens of absolute depth.\n",smartcache_grid_spacing);
+                printf("SmartCache: %d grid slots + head + boundary rung. No conversation-swap slots, no lifeboat.\n",savestate_limit-2);
+                if(smartcache_budget_bytes==0)
+                {
+                    printf("SmartCache: WARNING - no --smartcachemb budget set. A full grid at this context size is\n");
+                    printf("            not bounded by the slot count alone; set a budget in MB.\n");
+                }
             }
         }
         if(!kcpp_data->use_fastforward && kcpp_data->smartcache)
@@ -5579,7 +5602,7 @@ static int smartcache_grid_snapshot()
         return identical_slot;
     }
     int nearby_slot = get_nearby_compatible_smartcache_slot();
-    if(nearby_slot!=-1 && nearby_slot!=rnn_reusable_slot_idx && !(rnn_lifeboat_hard_reserved && nearby_slot==rnn_lifeboat_slot_idx))
+    if(nearby_slot!=-1 && nearby_slot!=rnn_reusable_slot_idx && nearby_slot!=rnn_boundary_slot_idx && !(rnn_lifeboat_hard_reserved && nearby_slot==rnn_lifeboat_slot_idx))
     {
         if(savestates[nearby_slot].savestate_context_tokens.size() <= current_context_tokens.size())
         {
@@ -5589,7 +5612,7 @@ static int smartcache_grid_snapshot()
         gpttype_save_state_kv(nearby_slot);
         return nearby_slot;
     }
-    int victim = get_evictable_slot(rnn_reusable_slot_idx,-1);
+    int victim = get_evictable_slot(rnn_reusable_slot_idx,rnn_boundary_slot_idx);
     if(victim==-1)
     {
         return -1; //no slot this write is allowed to take - skip the grid point rather than clobber the head
@@ -6250,7 +6273,16 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         bestslot = i;
                     }
                 }
-                if(bestslot!=-1) //found a good slot to load
+                if(bestslot!=-1 && smartcache_grid_mode)
+                {
+                    //Grid mode holds only generation-free checkpoints. The outgoing context is
+                    //already covered by the head checkpoint, so there is nothing to preserve here
+                    //and no prompt+generation state is written into the grid. The load is also
+                    //unconditional, so the oldest_slot!=bestslot guard cannot skip it.
+                    printf("\n[SmartCache RNN Match of %d tokens in slot %d. Switching...]\n",bestlen,bestslot);
+                    gpttype_load_state_kv(bestslot);
+                }
+                else if(bestslot!=-1) //found a good slot to load
                 {
                     int oldest_slot = get_oldest_slot(bestslot);
                     if(oldest_slot!=bestslot)
@@ -6273,7 +6305,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         gpttype_load_state_kv(bestslot);
                     }
                 }
-                else
+                else if(!smartcache_grid_mode) //grid mode never writes prompt+generation states
                 {
                     if(current_context_tokens.size() > 32) //do not save tiny contexts
                     {
@@ -6662,7 +6694,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             if(embd.size()<=48)
                             {
                                 //directly snapshot for a small batch
-                                smartcache_quick_snapshot();
+                                smartcache_quick_snapshot(rnn_boundary_slot_idx);
                             }
                             else
                             {
@@ -6675,7 +6707,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 {
                                     if(p==parts.size()-1)
                                     {
-                                        smartcache_quick_snapshot();
+                                        smartcache_quick_snapshot(rnn_boundary_slot_idx);
                                     }
                                     std::vector<gpt_vocab::id> chunk = parts[p];
                                     kcpp_embd_batch smallbatch = kcpp_embd_batch(chunk, temp_past, use_mrope, draft_is_mtp);
@@ -7773,7 +7805,8 @@ int get_evictable_slot(int excludeSlotA, int excludeSlotB)
     int slotid = -1;
     for(int i=0;i<savestate_limit;++i)
     {
-        if(i==excludeSlotA || i==excludeSlotB || (rnn_lifeboat_hard_reserved && i==rnn_lifeboat_slot_idx))
+        if(i==excludeSlotA || i==excludeSlotB || i==rnn_boundary_slot_idx
+           || (rnn_lifeboat_hard_reserved && i==rnn_lifeboat_slot_idx))
         {
             continue;
         }

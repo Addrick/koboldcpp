@@ -2127,12 +2127,16 @@ def load_model(model_filename):
     inputs.prevent_swa = args.noswa
     inputs.swa_padding = 0 if args.noswa else args.swapadding
     scint = int(args.smartcache)
-    inputs.smartcache = False if scint<=0 else True
+    scgrid = (args.smartcachegrid if args.smartcachegrid and args.smartcachegrid>0 else 0)
+    if scgrid>0 and scint>0:
+        print("Note: --smartcachegrid is set, so --smartcache is ignored. They are separate modes: "
+              "--smartcache swaps between conversations, --smartcachegrid checkpoints one deep context.")
+    inputs.smartcache = True if (scint>0 or scgrid>0) else False
     sclimit = (savestate_limit_default if scint<=1 else scint)
     savestate_limit = sclimit
     inputs.smartcacheslots = sclimit
     inputs.smartcachemb = (args.smartcachemb if args.smartcachemb and args.smartcachemb>0 else 0)
-    inputs.smartcachegrid = (args.smartcachegrid if args.smartcachegrid and args.smartcachegrid>0 else 0)
+    inputs.smartcachegrid = scgrid
     inputs.pipelineparallel = (not args.nopipelineparallel)
     inputs.continuous_batching_slots = args.parallelrequests if (args.parallelrequests>1) else 0
     inputs.rpc_mode = (2 if args.rpcmode=="host" else (1 if args.rpcmode=="connect" else 0))
