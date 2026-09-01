@@ -3587,7 +3587,9 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                 kcpp_data->smartcache = true;
                 savestate_limit += 1;
                 rnn_reusable_slot_idx = savestate_limit - 1;
-                if(inputs.smartcacheslots >= smartcache_rnn_lifeboat_extra_slot_min_user_slots)
+                //the grid supersedes the lifeboat, so do not reserve a slot for it - a
+                //hard-reserved slot no write site can reach is a slot permanently lost
+                if(inputs.smartcacheslots >= smartcache_rnn_lifeboat_extra_slot_min_user_slots && inputs.smartcachegrid <= 0)
                 {
                     savestate_limit += 1;
                     rnn_lifeboat_slot_idx = savestate_limit - 1;
