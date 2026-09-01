@@ -349,6 +349,8 @@ class load_model_inputs(ctypes.Structure):
                 ("swa_padding", ctypes.c_int),
                 ("smartcache", ctypes.c_bool),
                 ("smartcacheslots", ctypes.c_int),
+                ("smartcachemb", ctypes.c_int),
+                ("smartcachegrid", ctypes.c_int),
                 ("pipelineparallel", ctypes.c_bool),
                 ("lora_multiplier", ctypes.c_float),
                 ("devices_override", ctypes.c_char_p),
@@ -2129,6 +2131,8 @@ def load_model(model_filename):
     sclimit = (savestate_limit_default if scint<=1 else scint)
     savestate_limit = sclimit
     inputs.smartcacheslots = sclimit
+    inputs.smartcachemb = (args.smartcachemb if args.smartcachemb and args.smartcachemb>0 else 0)
+    inputs.smartcachegrid = (args.smartcachegrid if args.smartcachegrid and args.smartcachegrid>0 else 0)
     inputs.pipelineparallel = (not args.nopipelineparallel)
     inputs.continuous_batching_slots = args.parallelrequests if (args.parallelrequests>1) else 0
     inputs.rpc_mode = (2 if args.rpcmode=="host" else (1 if args.rpcmode=="connect" else 0))
@@ -12855,6 +12859,8 @@ if __name__ == '__main__':
     advparser.add_argument("--savedatafile", metavar=('[savefile]'), help="If enabled, creates or opens a persistent database file on the server, that allows users to save and load their data remotely. A new file is created if it does not exist.", default="")
     advparser.add_argument("--singleinstance", help="Allows this KoboldCpp instance to be shut down by any new instance requesting the same port, preventing duplicate servers from clashing on a port.", action='store_true')
     advparser.add_argument("--smartcache", help="Enables intelligent context switching by saving KV cache snapshots to RAM. Requires fast forwarding.", metavar=('limit'), nargs='?', const=1, type=int, default=0)
+    advparser.add_argument("--smartcachemb", help="Caps total SmartCache savestate memory in MB. Slots are evicted oldest-first until an incoming snapshot fits. 0 = unlimited (default, current behavior).", metavar=('[megabytes]'), type=int, default=0)
+    advparser.add_argument("--smartcachegrid", help="Places SmartCache checkpoints on an absolute token-depth grid every N tokens, instead of a single prompt-relative lifeboat. Helps recurrent/hybrid models on edit-and-retry. 0 = disabled (default, current behavior).", metavar=('[tokens]'), type=int, default=0)
     advparser.add_argument("--smartcontext", help="Reserving a portion of context to try processing less frequently. Outdated. Not recommended.", action='store_true')
     advparser.add_argument("--splitmode","-sm","--split-mode", help="How to split the model across multiple GPUs", metavar=('[split mode]'), type=str, choices=splitmode_choices, default=splitmode_choices[0])
     advparser.add_argument("--ssl", help="Allows all content to be served over SSL instead. A valid UNENCRYPTED SSL cert and key .pem files must be provided", metavar=('[cert_pem]', '[key_pem]'), nargs='+')

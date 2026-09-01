@@ -82,6 +82,8 @@ struct load_model_inputs
     const int swa_padding = 0;
     const bool smartcache = false;
     const int smartcacheslots = 0;
+    const int smartcachemb = 0;
+    const int smartcachegrid = 0;
     const bool pipelineparallel = false;
     const float lora_multiplier = 1.0f;
     const char * devices_override = nullptr;

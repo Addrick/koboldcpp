@@ -189,6 +189,18 @@ static const int smartcache_rnn_lifeboat_min_prompt_tokens = 2048;
 static const int smartcache_rnn_lifeboat_percent = 65;
 static const int smartcache_rnn_lifeboat_extra_slot_min_user_slots = 4;
 
+//byte accounting: total_savestate_bytes is the live sum of every slot's savestate
+//buffers, smartcache_budget_bytes (0 = unlimited) is the cap it is evicted against.
+static size_t total_savestate_bytes = 0;
+static size_t smartcache_budget_bytes = 0;
+
+//absolute-depth checkpoint grid. Placement is absolute (multiples of the spacing), so a
+//retry or edit of the same conversation re-derives the same depths and dedups into the
+//slots that already hold them, instead of anchoring at a moving prompt-relative percent.
+static int smartcache_grid_spacing = 0;
+static const int smartcache_grid_min_spacing = 256; //finer than the 150-token nearby-dedup window, grid points collapse into each other
+static int smartcache_grid_next_depth = 0;
+
 extern bool kcpp_permit_any_repack;
 extern bool kcpp_pipeline_parallelism;
 extern bool OldBPETokenizerMode;
@@ -3584,9 +3596,25 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             }
         }
         savestates.resize(savestate_limit);
+        total_savestate_bytes = 0;
+        smartcache_budget_bytes = (inputs.smartcachemb > 0 ? (size_t)inputs.smartcachemb * 1024ull * 1024ull : 0);
+        smartcache_grid_spacing = (inputs.smartcachegrid > 0 ? inputs.smartcachegrid : 0);
+        if(smartcache_grid_spacing > 0 && smartcache_grid_spacing < smartcache_grid_min_spacing)
+        {
+            printf("SmartCache: grid spacing %d is too fine, clamping to %d tokens.\n",smartcache_grid_spacing,smartcache_grid_min_spacing);
+            smartcache_grid_spacing = smartcache_grid_min_spacing;
+        }
         if(kcpp_data->smartcache)
         {
             printf("SmartCache: Prepared %d KV slots\n",savestate_limit);
+            if(smartcache_budget_bytes>0)
+            {
+                printf("SmartCache: Memory budget %zu MB, oldest slots evicted to fit.\n",smartcache_budget_bytes/(1024*1024));
+            }
+            if(smartcache_grid_spacing>0)
+            {
+                printf("SmartCache: Checkpoint grid every %d tokens of absolute depth (supersedes the RNN lifeboat).\n",smartcache_grid_spacing);
+            }
         }
         if(!kcpp_data->use_fastforward && kcpp_data->smartcache)
         {
@@ -5537,6 +5565,37 @@ static int get_nearby_compatible_smartcache_slot()
     return best_slot;
 }
 
+//A grid checkpoint is a generation-free snapshot at an absolute depth. It must never
+//land in the head-checkpoint slot or the hard-reserved lifeboat slot, so it cannot use
+//smartcache_quick_snapshot's get_oldest_slot(-1) victim choice.
+static int smartcache_grid_snapshot()
+{
+    int identical_slot = get_identical_existing_slot();
+    if(identical_slot!=-1) //this exact depth is already checkpointed - a retry re-deriving the grid
+    {
+        touch_slot(identical_slot);
+        return identical_slot;
+    }
+    int nearby_slot = get_nearby_compatible_smartcache_slot();
+    if(nearby_slot!=-1 && nearby_slot!=rnn_reusable_slot_idx && !(rnn_lifeboat_hard_reserved && nearby_slot==rnn_lifeboat_slot_idx))
+    {
+        if(savestates[nearby_slot].savestate_context_tokens.size() <= current_context_tokens.size())
+        {
+            touch_slot(nearby_slot);
+            return nearby_slot;
+        }
+        gpttype_save_state_kv(nearby_slot);
+        return nearby_slot;
+    }
+    int victim = get_evictable_slot(rnn_reusable_slot_idx,-1);
+    if(victim==-1)
+    {
+        return -1; //no slot this write is allowed to take - skip the grid point rather than clobber the head
+    }
+    gpttype_save_state_kv(victim);
+    return victim;
+}
+
 int smartcache_quick_snapshot(int specific_slot = -1)
 {
     int identical_slot = get_identical_existing_slot();
@@ -6471,7 +6530,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     bool v3_use_scratch = true; //for normal inference always use scratch
     bool rnn_lifeboat_taken = false;
     const int rnn_lifeboat_target = (int)((embd_inp.size() * smartcache_rnn_lifeboat_percent) / 100);
-    const bool rnn_lifeboat_enabled = kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && (int)embd_inp.size() >= smartcache_rnn_lifeboat_min_prompt_tokens;
+    const bool rnn_grid_enabled = smartcache_grid_spacing > 0 && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC;
+    //the grid supersedes the lifeboat: it places a checkpoint every G tokens, which is
+    //strictly denser than the single 65%-of-this-prompt point, and at depths that survive an edit.
+    const bool rnn_lifeboat_enabled = !rnn_grid_enabled && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && (int)embd_inp.size() >= smartcache_rnn_lifeboat_min_prompt_tokens;
+    if(rnn_grid_enabled)
+    {
+        //next absolute grid line strictly above where this prefill resumes
+        smartcache_grid_next_depth = ((n_past / smartcache_grid_spacing) + 1) * smartcache_grid_spacing;
+    }
 
     speculative_draft_result draft_results; //only use if drafting was used
     bool draft_used = false;
@@ -6750,6 +6817,18 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         }
 
         n_past += embd.size();
+        if(rnn_grid_enabled && !startedsampling && n_past >= smartcache_grid_next_depth && input_consumed < (int)embd_inp.size() && (int)current_context_tokens.size() > 32)
+        {
+            int grid_slot = smartcache_grid_snapshot();
+            if(grid_slot!=-1)
+            {
+                printf("\n[SmartCache Grid: Saved %zu-token checkpoint into slot %d]\n",current_context_tokens.size(),grid_slot);
+            }
+            while(smartcache_grid_next_depth <= n_past)
+            {
+                smartcache_grid_next_depth += smartcache_grid_spacing;
+            }
+        }
         if(rnn_lifeboat_enabled && !rnn_lifeboat_taken && !startedsampling && n_past >= rnn_lifeboat_target && input_consumed < (int)embd_inp.size())
         {
             int lifeboat_slot = rnn_lifeboat_hard_reserved ? smartcache_quick_snapshot(rnn_lifeboat_slot_idx) : smartcache_quick_snapshot();
@@ -7371,6 +7450,12 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     {
                         break;
                     }
+                    //land exactly on the grid line, so a checkpoint's depth is a function of the
+                    //conversation and not of where the batch boundaries happened to fall this run
+                    if (smartcache_grid_spacing > 0 && !startedsampling && n_past + (int)embd.size() >= smartcache_grid_next_depth)
+                    {
+                        break;
+                    }
                 }
 
             }
@@ -7483,6 +7568,8 @@ size_t gpttype_save_state_kv(int slot)
     {
         size_t totalbytes = 0;
         if (!savestates[slot].current_savestate_buffer.empty()) {  //JIT free
+            size_t freed = savestates[slot].current_savestate_size + savestates[slot].current_draft_savestate_size;
+            total_savestate_bytes = (total_savestate_bytes > freed ? total_savestate_bytes - freed : 0);
             savestates[slot].current_savestate_buffer.clear();
             savestates[slot].current_draft_savestate_buffer.clear();
             savestates[slot].savestate_context_tokens.clear();
@@ -7492,6 +7579,18 @@ size_t gpttype_save_state_kv(int slot)
             savestates[slot].media_signature = "";
         }
         size_t newsize = llama_state_get_size(llama_ctx_v4);
+        //evict oldest-first until this snapshot fits the budget. llama_state_get_size is
+        //already known here, so the exact cost is priced before anything is committed.
+        while(smartcache_budget_bytes > 0 && total_savestate_bytes + newsize > smartcache_budget_bytes)
+        {
+            int victim = get_evictable_slot(slot,-1);
+            if(victim==-1 || savestates[victim].current_savestate_buffer.empty())
+            {
+                break; //nothing left that may be freed - allocate anyway rather than fail the request
+            }
+            printf("\nSmartCache: over budget, evicting slot %d.",victim);
+            free_savestate_slot(victim, true);
+        }
         try {
             if (savestates[slot].current_savestate_buffer.capacity() < newsize + 512) {
                 savestates[slot].current_savestate_buffer = std::vector<uint8_t>(newsize + 512); // add some padding. May throw std::bad_alloc
@@ -7506,6 +7605,7 @@ size_t gpttype_save_state_kv(int slot)
         if (res > 0) {
             totalbytes += res;
             savestates[slot].current_savestate_size   = newsize;
+            total_savestate_bytes += newsize;
             savestates[slot].savestate_context_tokens = current_context_tokens;
             savestates[slot].media_signature = media_composite_image_signature;
             float * lgptr = (draft_is_mtp ? llama_get_logits_ith(llama_ctx_v4, -1) : llama_get_logits(llama_ctx_v4));
@@ -7545,6 +7645,7 @@ size_t gpttype_save_state_kv(int slot)
             if (res2 > 0) {
                 totalbytes += res2;
                 savestates[slot].current_draft_savestate_size = newsize2;
+                total_savestate_bytes += newsize2;
                 printf("\nKV Save State %d: Created DraftSaveState of %zu tokens, costing %zu MB.\n",slot,current_context_tokens.size(),savestates[slot].current_draft_savestate_size/(1024*1024));
             }
         }
@@ -7582,6 +7683,33 @@ bool gpttype_load_state_kv(int slot)
     }
     return false;
 }
+void free_savestate_slot(int slot, bool shrink)
+{
+    if (savestates[slot].current_savestate_buffer.empty()) {
+        return;
+    }
+    printf("\nKV Clear SaveState %d: Freed %zu MB.\n",slot, savestates[slot].current_savestate_size / (1024 * 1024));
+    size_t freed = savestates[slot].current_savestate_size + savestates[slot].current_draft_savestate_size;
+    total_savestate_bytes = (total_savestate_bytes > freed ? total_savestate_bytes - freed : 0);
+    savestates[slot].current_savestate_buffer.clear();
+    if(shrink)
+    {
+        savestates[slot].current_savestate_buffer.shrink_to_fit();
+    }
+    savestates[slot].savestate_context_tokens.clear();
+    savestates[slot].current_savestate_size = 0;
+    savestates[slot].media_signature = "";
+    if(savestates[slot].current_draft_savestate_size>0)
+    {
+        savestates[slot].current_draft_savestate_buffer.clear();
+        if(shrink)
+        {
+            savestates[slot].current_draft_savestate_buffer.shrink_to_fit();
+        }
+        savestates[slot].current_draft_savestate_size = 0;
+    }
+    savestates[slot].last_used = 0;
+}
 bool gpttype_clear_state_kv(bool shrink)
 {
     if(kcpp_data==nullptr)
@@ -7592,27 +7720,7 @@ bool gpttype_clear_state_kv(bool shrink)
     {
         for(int slot=0;slot<savestate_limit;++slot)
         {
-            if (!savestates[slot].current_savestate_buffer.empty()) {
-                printf("\nKV Clear SaveState %d: Freed %zu MB.\n",slot, savestates[slot].current_savestate_size / (1024 * 1024));
-                savestates[slot].current_savestate_buffer.clear();
-                if(shrink)
-                {
-                    savestates[slot].current_savestate_buffer.shrink_to_fit();
-                }
-                savestates[slot].savestate_context_tokens.clear();
-                savestates[slot].current_savestate_size = 0;
-                savestates[slot].media_signature = "";
-                if(draft_ctx && savestates[slot].current_draft_savestate_size>0)
-                {
-                    savestates[slot].current_draft_savestate_buffer.clear();
-                    if(shrink)
-                    {
-                        savestates[slot].current_draft_savestate_buffer.shrink_to_fit();
-                    }
-                    savestates[slot].current_draft_savestate_size = 0;
-                }
-                savestates[slot].last_used = 0;
-            }
+            free_savestate_slot(slot, shrink);
         }
         return true;
     }
@@ -7649,6 +7757,32 @@ int get_identical_existing_slot() //returns slot number of slot containing exact
                 slotid = i;
                 break;
             }
+        }
+    }
+    return slotid;
+}
+
+//Like get_oldest_slot, but only ever returns a slot that actually holds something, and
+//returns -1 when there is no legal victim. get_oldest_slot's 0 default is a phantom victim
+//and cannot be looped on; this is the version the byte-budget and grid paths use.
+int get_evictable_slot(int excludeSlotA, int excludeSlotB)
+{
+    int64_t slotage = INT64_MAX;
+    int slotid = -1;
+    for(int i=0;i<savestate_limit;++i)
+    {
+        if(i==excludeSlotA || i==excludeSlotB || (rnn_lifeboat_hard_reserved && i==rnn_lifeboat_slot_idx))
+        {
+            continue;
+        }
+        if(savestates[i].current_savestate_buffer.empty()) //free slot - take it before evicting anything
+        {
+            return i;
+        }
+        if(savestates[i].last_used <= slotage)
+        {
+            slotage = savestates[i].last_used;
+            slotid = i;
         }
     }
     return slotid;
