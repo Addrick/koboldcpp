@@ -214,6 +214,9 @@ static size_t smartcache_budget_bytes = 0;
 //and 25% of edit positions costing a full reprocess - kcpp-ops tests/ladder_sim.py.
 static const int smartcache_ladder_min_gap = 4096;   //floor for N; shallow conversations stay fine-grained
 static const int smartcache_ladder_tail_offset = 32; //head checkpoint sits this far back - see smartcache_ladder_write_head
+//Eviction sorts on depth; adding this to a live rung's rank puts every live rung behind every
+//dead one without needing a second sort key. Larger than any reachable context length.
+#define SMARTCACHE_LIVE_RANK_BIAS (1LL<<40)
 
 //Live cost model for a savestate: bytes(d) ~= cost_fixed + cost_rate * d. Both are learned
 //from real snapshots rather than hardcoded, because the rate swings widely with the model,
@@ -5699,8 +5702,27 @@ static int smartcache_ladder_gap(int head_depth)
     return (gap < smartcache_ladder_min_gap ? smartcache_ladder_min_gap : gap);
 }
 
+//IS THIS RUNG STILL REACHABLE? An edit at depth D rewrites the text above D, so every rung
+//above D holds tokens that can never be a prefix of the live context again - it is DEAD. It is
+//MARKED, never deleted ahead of time: a rung on a branch you edited away is not worthless,
+//because undoing the edit makes it live again. That is why this is asked fresh every time it
+//matters rather than latched into a flag when the edit lands.
+//
+//Equal over the shorter of the two, per smartcache_prefix_compatible - so a rung DEEPER than
+//the live head is live. That is the retry case: the context has not diverged, it has only not
+//been regrown yet.
+static bool smartcache_ladder_rung_live(int i)
+{
+    return smartcache_prefix_compatible(savestates[i].savestate_context_tokens,current_context_tokens);
+}
+
 //Distance from `depth` back to the nearest checkpoint at or below it. INT32_MAX when there is
 //no fallback at all - which is exactly when a write is most worth taking.
+//
+//Dead rungs do not count. They are why the ladder could not backfill after an edit: a dead rung
+//just below the head answered "there is already a fallback here", so the guard refused every
+//write between the edit point and the deepest dead rung, and the ladder starved by invalidation
+//rather than by budget.
 static int smartcache_ladder_nearest_below(int depth)
 {
     int best = INT32_MAX;
@@ -5711,6 +5733,10 @@ static int smartcache_ladder_nearest_below(int depth)
             continue;
         }
         if(savestates[i].current_savestate_buffer.empty())
+        {
+            continue;
+        }
+        if(!smartcache_ladder_rung_live(i)) //dead: holds pre-edit text, can never be resumed from
         {
             continue;
         }
@@ -5739,16 +5765,17 @@ static void smartcache_ladder_inventory(const char *why)
         }
         ++n;
         held += savestates[i].current_savestate_size;
-        snprintf(buf,sizeof(buf)," s%d@%zu(%zuMB)%s",i,
+        snprintf(buf,sizeof(buf)," s%d@%zu(%zuMB)%s%s",i,
                  savestates[i].savestate_context_tokens.size(),
                  savestates[i].current_savestate_size/(1024*1024),
-                 (i==rnn_reusable_slot_idx ? "*" : ""));
+                 (i==rnn_reusable_slot_idx ? "*" : ""),
+                 (smartcache_ladder_rung_live(i) ? "" : "!"));
         items += buf;
     }
     //Name the head slot in the header, not only via the marker: right after a promotion the
     //head has moved to a slot that is still empty, so it prints no entry to mark and the line
     //would claim there is no head at all.
-    printf("\n[SmartCache Inventory (%s): %d held, %zu/%zu MB, head=s%d |%s ] * = head\n",
+    printf("\n[SmartCache Inventory (%s): %d held, %zu/%zu MB, head=s%d |%s ] * = head, ! = dead\n",
            why, n, held/(1024*1024), smartcache_budget_bytes/(1024*1024),
            rnn_reusable_slot_idx, items.c_str());
 }
@@ -8041,11 +8068,24 @@ int get_evictable_slot(int excludeSlotA, int excludeSlotB)
             continue;
         }
         //In ladder mode, recency is not a meaningful ordering - rungs are written one per turn and
-        //never re-read until an edit needs one, so last_used says nothing. Depth is the ordering:
-        //drop the SHALLOWEST, the oldest part of the conversation and the least likely to be
-        //edited. The dynamic gap is what stops this from walking the whole ladder forward.
-        int64_t rank = (smartcache_grid_mode ? (int64_t)savestates[i].savestate_context_tokens.size()
-                                             : savestates[i].last_used);
+        //never re-read until an edit needs one, so last_used says nothing. The ordering here is
+        //DEAD BEFORE LIVE, then shallowest within each class.
+        //
+        //Deadness has to outrank depth. A dead rung's bytes buy nothing, so spending a live
+        //deep-history rung while a dead one is still held is strictly worse - and that is what
+        //happened: after a few edits the ladder held 2-3 rungs and a fifth of edit positions
+        //full-reprocessed, with the budget never once reached. Shallowest within a class is the
+        //old rule: the oldest part of the conversation, the least likely to be edited. The
+        //dynamic gap is what stops that from walking the whole ladder forward.
+        int64_t rank = savestates[i].last_used;
+        if(smartcache_grid_mode)
+        {
+            rank = (int64_t)savestates[i].savestate_context_tokens.size();
+            if(smartcache_ladder_rung_live(i))
+            {
+                rank += SMARTCACHE_LIVE_RANK_BIAS; //every live rung sorts behind every dead one
+            }
+        }
         if(rank < slotage || slotid==-1)
         {
             slotage = rank;
