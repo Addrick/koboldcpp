@@ -7838,8 +7838,23 @@ size_t gpttype_save_state_kv(int slot)
                        (total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
                 break;
             }
-            printf("\nSmartCache: over budget, evicting slot %d @ depth %zu (%zu MB freed; %zu MB held, %zu MB incoming for slot %d @ depth %zu, %zu MB cap).\n",
+            //Say whether the victim was reachable, and how many unreachable rungs were on the
+            //table at the same moment. Deadness is relative to the LIVE context, so it flips
+            //when the conversation does - a harness that reads it from the previous turn's
+            //inventory gets the answer backwards on exactly the steps that matter (a swap, or
+            //returning from a foreign prompt). Only the build knows, and only right here.
+            int deadheld = 0;
+            for(int i=0;i<savestate_limit;++i)
+            {
+                if(!savestates[i].current_savestate_buffer.empty()
+                   && i!=rnn_reusable_slot_idx && !smartcache_ladder_rung_live(i))
+                {
+                    ++deadheld;
+                }
+            }
+            printf("\nSmartCache: over budget, evicting slot %d @ depth %zu [victim=%s, %d dead held] (%zu MB freed; %zu MB held, %zu MB incoming for slot %d @ depth %zu, %zu MB cap).\n",
                    victim,savestates[victim].savestate_context_tokens.size(),
+                   (smartcache_ladder_rung_live(victim) ? "live" : "dead"), deadheld,
                    savestates[victim].current_savestate_size/(1024*1024),
                    (total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),
                    slot,current_context_tokens.size(),
@@ -8069,18 +8084,26 @@ int get_evictable_slot(int excludeSlotA, int excludeSlotB)
         }
         //In ladder mode, recency is not a meaningful ordering - rungs are written one per turn and
         //never re-read until an edit needs one, so last_used says nothing. The ordering here is
-        //DEAD BEFORE LIVE, then shallowest within each class.
+        //DEAD BEFORE LIVE, then DEEPEST within each class.
         //
         //Deadness has to outrank depth. A dead rung's bytes buy nothing, so spending a live
         //deep-history rung while a dead one is still held is strictly worse - and that is what
         //happened: after a few edits the ladder held 2-3 rungs and a fifth of edit positions
-        //full-reprocessed, with the budget never once reached. Shallowest within a class is the
-        //old rule: the oldest part of the conversation, the least likely to be edited. The
-        //dynamic gap is what stops that from walking the whole ladder forward.
+        //full-reprocessed, with the budget never once reached.
+        //
+        //DEEPEST, not shallowest. Shallowest was the old rule, on the reasoning that the oldest
+        //part of the conversation is the least likely to be edited, and it is backwards twice
+        //over. Shallow rungs are the CHEAPEST, so freeing a given number of bytes costs several
+        //of them; and they cover the widest spans, because nothing else sits below them. The
+        //deepest rung is the one the head checkpoint already shadows. Measured 2026-09-02: one
+        //244 MB write evicted 2353, 6625 and 10943 - the entire low ladder - and every edit
+        //after that full-reprocessed. Deepest-first frees the same bytes in one eviction and
+        //keeps all three. With the budget not binding the two rules pick the same slots, so
+        //this only changes behaviour under pressure.
         int64_t rank = savestates[i].last_used;
         if(smartcache_grid_mode)
         {
-            rank = (int64_t)savestates[i].savestate_context_tokens.size();
+            rank = -(int64_t)savestates[i].savestate_context_tokens.size();
             if(smartcache_ladder_rung_live(i))
             {
                 rank += SMARTCACHE_LIVE_RANK_BIAS; //every live rung sorts behind every dead one
