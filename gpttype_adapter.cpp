@@ -197,30 +197,23 @@ static const int smartcache_rnn_lifeboat_extra_slot_min_user_slots = 4;
 static size_t total_savestate_bytes = 0;
 static size_t smartcache_budget_bytes = 0;
 
-//absolute-depth checkpoint grid. Placement is absolute (multiples of the base spacing), so a
-//retry or edit of the same conversation re-derives the same depths and dedups into the
-//slots that already hold them, instead of anchoring at a moving prompt-relative percent.
-static const int smartcache_grid_base_spacing = 256; //finer than the 150-token nearby-dedup window, grid points collapse into each other
-static int smartcache_grid_spacing = 0;              //0 = grid off. Otherwise always the base; density is set by thinning, not by spacing.
-static int smartcache_grid_next_depth = 0;
-
-//RETENTION. A checkpoint is kept at a density that falls off with its RECESSION s = D - d,
-//its distance back from the current head. Optimal density is sqrt(p(d) / cost(d)) - edit
-//likelihood over checkpoint cost - and edits land overwhelmingly in the tail, so density
-//should be highest there. Expressed as a level: a point at depth d survives while
-//(d / base) is a multiple of 2^level(s), i.e. spacing widens roughly in proportion to s.
+//OPPORTUNISTIC CHECKPOINT LADDER. One rule governs every ladder write: take a checkpoint only
+//if there is no fallback within N tokens of where we already are. Snapshots happen after a
+//turn completes, at whatever depth the KV is already sitting at - never scheduled mid-prefill,
+//never at a computed absolute depth. The ladder deepens as the conversation does.
 //
-//The property that makes this work on the fly: s only ever GROWS as the conversation
-//advances, so level only ever grows, so the surviving set only ever SHRINKS. Points are
-//dropped, never needed-but-missing, and nothing is ever repositioned - placement stays
-//absolute and retry-dedup is untouched. A head-RELATIVE shape (50%/75%/87.5% of D) does
-//not have this property: its targets move with D, which is the moving-anchor defect the
-//lifeboat had.
+//Nothing else ever deletes a checkpoint. There is no retention sweep, nothing about the
+//incoming prompt influences what is kept, and an aborted turn leaves the ladder untouched
+//because no ladder code runs before a prefill any more. Space is reclaimed only to fund a
+//write, one victim at a time, shallowest first (get_evictable_slot).
 //
-//smartcache_grid_level_offset is the single budget-derived knob. Each +1 halves the point
-//count. Recomputed per prefill from the live cost model, so it tracks both directions.
-static int smartcache_grid_level_offset = 0;
-static const int smartcache_grid_max_level_offset = 20; //256<<20 outgrows any n_ctx and still fits an int
+//N is DYNAMIC, and that is the part that makes the shape work. Held flat, oldest-first
+//eviction walks the whole ladder forward with the head and abandons deep history; grown with
+//depth, the same number of points keeps SPREADING to span the whole conversation. Simulated
+//over a 160k-token conversation on the measured cost curve that is the difference between 97%
+//and 25% of edit positions costing a full reprocess - kcpp-ops tests/ladder_sim.py.
+static const int smartcache_ladder_min_gap = 4096;   //floor for N; shallow conversations stay fine-grained
+static const int smartcache_ladder_tail_offset = 32; //head checkpoint sits this far back - see smartcache_ladder_write_head
 
 //Live cost model for a savestate: bytes(d) ~= cost_fixed + cost_rate * d. Both are learned
 //from real snapshots rather than hardcoded, because the rate swings widely with the model,
@@ -3629,11 +3622,12 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                 kcpp_data->smartcache = true;
                 //Ceiling only: an empty savestate_data is ~150 bytes, so even 640 of them cost
                 //~96 KB. Slot count deliberately stops being a resource - bytes are the bound.
-                savestate_limit = (kcpp_data->n_ctx + smartcache_grid_base_spacing - 1) / smartcache_grid_base_spacing;
+                savestate_limit = (kcpp_data->n_ctx + smartcache_ladder_min_gap - 1) / smartcache_ladder_min_gap;
                 savestate_limit += 1;
-                rnn_reusable_slot_idx = savestate_limit - 1;   //head checkpoint, keeps retries at 0 tokens
-                savestate_limit += 1;
-                rnn_boundary_slot_idx = savestate_limit - 1;   //prompt_end-32 rung, keeps a retokenized tail at 32
+                rnn_reusable_slot_idx = savestate_limit - 1;   //the one unevictable point, rewritten in place each turn
+                //No boundary rung. It was a SECOND full-depth snapshot 31 tokens from this one,
+                //written unconditionally every turn; the head checkpoint is placed 32 tokens back
+                //instead and does both jobs for half the bytes.
             }
             else if(savestate_limit>0)
             {
@@ -3651,9 +3645,6 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
         }
         savestates.resize(savestate_limit);
         total_savestate_bytes = 0;
-        smartcache_grid_spacing = (smartcache_grid_mode ? smartcache_grid_base_spacing : 0);
-        smartcache_grid_next_depth = 0;
-        smartcache_grid_level_offset = 0;
         smartcache_cost_fixed = 0.0;
         smartcache_cost_rate = 0.0;
         smartcache_cost_lo_tokens = 0;
@@ -3670,11 +3661,11 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
             printf("SmartCache: Prepared %d KV slots\n",savestate_limit);
             if(smartcache_grid_mode)
             {
-                printf("SmartCache: GRID MODE - %zu MB budget, checkpoints placed every %d tokens of absolute depth.\n",
-                       smartcache_budget_bytes/(1024*1024),smartcache_grid_base_spacing);
-                printf("SmartCache: Retention is adaptive - density falls off with distance back from the head,\n");
-                printf("            and how many points fit is derived from the measured cost of a snapshot.\n");
-                printf("SmartCache: %d grid slots (a ceiling) + head + boundary rung. No conversation-swap slots, no lifeboat.\n",savestate_limit-2);
+                printf("SmartCache: LADDER MODE - %zu MB budget. A checkpoint is taken after a turn\n",
+                       smartcache_budget_bytes/(1024*1024));
+                printf("            only when no fallback exists within N tokens. N grows with depth, so the\n");
+                printf("            ladder spreads instead of stacking at the head. Nothing else deletes one.\n");
+                printf("SmartCache: %d ladder slots (a ceiling) + 1 head checkpoint. No swap slots, no lifeboat, no rung.\n",savestate_limit-1);
             }
             else if(smartcache_budget_bytes>0)
             {
@@ -5680,155 +5671,42 @@ static double smartcache_estimated_cost(int tokens)
     return smartcache_cost_fixed + smartcache_cost_rate*(double)tokens;
 }
 
-//The budget offset COARSENS THE BASE UNIT: effective spacing is base << offset. It must not
-//instead be added to the level, which was the first attempt - that demands index divisibility
-//by 2^offset even in the head-adjacent band, and that band is only one or two indices wide,
-//so it is almost never divisible and the grid collapses to zero points at moderate offsets.
-static int smartcache_grid_effective_spacing(int offset)
-{
-    if(offset < 0)
-    {
-        offset = 0;
-    }
-    if(offset > smartcache_grid_max_level_offset)
-    {
-        offset = smartcache_grid_max_level_offset;
-    }
-    return smartcache_grid_base_spacing << offset;
-}
-
-//Retention level for a point sitting `recession` tokens back from the head, measured in units
-//of the effective spacing: floor(log2(recession/spacing)). A point survives while its index is
-//a multiple of 2^level, so the local spacing is spacing*2^level ~= recession - the grid is fine
-//at the tail and widens in proportion to how far back you are.
-static int smartcache_grid_level(int recession, int spacing)
-{
-    int level = 0;
-    int units = (spacing>0 ? recession / spacing : 0);
-    while(units > 1)
-    {
-        units >>= 1;
-        ++level;
-    }
-    if(level > smartcache_grid_max_level_offset)
-    {
-        level = smartcache_grid_max_level_offset;
-    }
-    return level;
-}
-
-//Does a checkpoint at absolute depth `depth` survive with the head at `head_depth`?
-//Monotone in head_depth at a fixed offset: recession only grows, so level only grows, so this
-//only ever goes from true to false. That is what lets the whole scheme run on the fly - points
-//are dropped, never needed-but-missing, and none is ever repositioned.
-static bool smartcache_grid_survives(int depth, int head_depth, int offset)
-{
-    if(depth <= 0)
-    {
-        return false;
-    }
-    if(depth % smartcache_grid_base_spacing != 0)
-    {
-        return true; //not on the grid - not ours to thin (the head checkpoint, a boundary rung)
-    }
-    int spacing = smartcache_grid_effective_spacing(offset);
-    if(depth % spacing != 0)
-    {
-        return false; //a point placed under a finer spacing, now coarsened past it
-    }
-    int recession = head_depth - depth;
-    if(recession < 0)
-    {
-        recession = 0;
-    }
-    int level = smartcache_grid_level(recession, spacing);
-    long long units = depth / spacing;
-    long long mask = (1LL << level) - 1;
-    return (units & mask) == 0;
-}
-
-//Smallest offset whose surviving grid fits the budget. The head checkpoint and the boundary
-//rung are both full-depth and both unevictable, so they are reserved off the top before the
-//grid gets to spend anything.
-static int smartcache_grid_solve_offset(int head_depth)
+//How many checkpoints of the CURRENT depth the budget could hold, after reserving the one
+//unevictable head checkpoint. Only used to set the gap, so it need not be exact - it needs to
+//shrink as a snapshot gets more expensive, which is what keeps the ladder spreading.
+static int smartcache_ladder_capacity(int head_depth)
 {
     if(smartcache_budget_bytes==0 || !smartcache_cost_model_ready())
     {
-        //Unbounded, or the cost model still rests on a single sample. One sample forces the
-        //line through the origin, which reads the whole fixed cost as marginal rate - ~262
-        //KB/token where the truth is ~19 - so the budget looks ~14x smaller than it is. Placing
-        //at the base spacing for one more grid line is far cheaper than thinning on that guess.
-        return 0;
+        return 1;
     }
-    double avail = (double)smartcache_budget_bytes - 2.0*smartcache_estimated_cost(head_depth);
-    if(avail <= 0.0)
+    double one = smartcache_estimated_cost(head_depth);
+    if(one <= 0.0)
     {
-        //Not a code path to be quiet about: the two full-depth per-turn checkpoints alone have
-        //outgrown the budget, so the grid gets nothing and only retries stay cheap. Cost is
-        //linear in depth, so this arrives by the conversation growing, not by a config mistake.
-        static int warned_at_depth = 0;
-        if(head_depth > warned_at_depth*2)
-        {
-            warned_at_depth = head_depth;
-            printf("\nSmartCache: WARNING - at %d tokens deep the head checkpoint and boundary rung alone\n",head_depth);
-            printf("            need ~%zu MB, over the %zu MB budget. No grid points will be kept;\n",
-                   (size_t)(2.0*smartcache_estimated_cost(head_depth))/(1024*1024), smartcache_budget_bytes/(1024*1024));
-            printf("            retries stay free but an edit will full-reprocess. Raise --smartcachegrid.\n");
-        }
-        return smartcache_grid_max_level_offset;
+        return 1;
     }
-    for(int offset=0; offset<smartcache_grid_max_level_offset; ++offset)
-    {
-        int spacing = smartcache_grid_effective_spacing(offset);
-        if(spacing > head_depth)
-        {
-            break; //coarser than the whole conversation - there is no grid left to thin
-        }
-        double total = 0.0;
-        for(int d=spacing; d<=head_depth; d+=spacing)
-        {
-            if(smartcache_grid_survives(d, head_depth, offset))
-            {
-                total += smartcache_estimated_cost(d);
-            }
-        }
-        if(total <= avail)
-        {
-            return offset;
-        }
-    }
-    return smartcache_grid_max_level_offset;
+    double avail = (double)smartcache_budget_bytes - one; //the head checkpoint is not the ladder's to spend
+    int n = (int)(avail / one);
+    return (n < 1 ? 1 : n);
 }
 
-//The next depth above `from_depth` that is worth WRITING. Skipping the doomed lines matters
-//twice: a checkpoint we would thin on the same prefill is pure write cost, and the prefill
-//batch is cut short at each of these depths, so aiming at every base multiple would shred
-//throughput into 256-token batches.
-static int smartcache_grid_next_write(int from_depth, int head_depth, int offset)
+//N: how far the conversation must have advanced past the nearest existing checkpoint before
+//another one earns its bytes.
+static int smartcache_ladder_gap(int head_depth)
 {
-    int spacing = smartcache_grid_effective_spacing(offset);
-    if(spacing > head_depth)
-    {
-        return INT32_MAX;
-    }
-    int d = ((from_depth / spacing) + 1) * spacing;
-    for(; d <= head_depth; d += spacing)
-    {
-        if(smartcache_grid_survives(d, head_depth, offset))
-        {
-            return d;
-        }
-    }
-    return INT32_MAX; //nothing left to write on this prefill
+    int cap = smartcache_ladder_capacity(head_depth);
+    int gap = head_depth / cap;
+    return (gap < smartcache_ladder_min_gap ? smartcache_ladder_min_gap : gap);
 }
 
-//Free every held grid point that has receded past its level. Runs before the prefill writes,
-//so the budget it frees is available to the points being placed this turn.
-static void smartcache_grid_thin(int head_depth, int offset)
+//Distance from `depth` back to the nearest checkpoint at or below it. INT32_MAX when there is
+//no fallback at all - which is exactly when a write is most worth taking.
+static int smartcache_ladder_nearest_below(int depth)
 {
+    int best = INT32_MAX;
     for(int i=0;i<savestate_limit;++i)
     {
-        if(i==rnn_reusable_slot_idx || i==rnn_boundary_slot_idx || i==smartcache_protected_slot)
+        if(i==rnn_reusable_slot_idx) //rewritten every turn - never a durable fallback
         {
             continue;
         }
@@ -5836,28 +5714,44 @@ static void smartcache_grid_thin(int head_depth, int offset)
         {
             continue;
         }
-        int depth = (int)savestates[i].savestate_context_tokens.size();
-        if(depth > head_depth)
+        int d = (int)savestates[i].savestate_context_tokens.size();
+        if(d <= depth && depth-d < best)
         {
-            //A checkpoint deeper than the head has not receded from anything, so no retention
-            //rule can justify dropping it. Reaching here means head_depth is wrong, and without
-            //this guard that mistake silently frees the entire grid rather than failing loudly.
-            continue;
-        }
-        if(!smartcache_grid_survives(depth, head_depth, offset))
-        {
-            printf("\n[SmartCache Grid: thinned %d-token checkpoint from slot %d - receded %d]\n",
-                   depth, i, head_depth-depth);
-            free_savestate_slot(i, true);
+            best = depth-d;
         }
     }
+    return best;
 }
+
+//THE GUARD. Everything the old retention machine did is replaced by this one question, asked
+//per candidate write: is there already a fallback within N tokens of here?
+//
+//What it subsumes, each of which used to be its own mechanism or its own defect:
+//  - a RETRY is 0 tokens from the head checkpoint, so it writes nothing. Retries consuming the
+//    budget is the behaviour this feature exists to fix; it is now the default case of one
+//    guard rather than a reserved slot plus a dedup path.
+//  - the prompt_end-32 BOUNDARY RUNG was a second full-depth snapshot written unconditionally
+//    31 tokens from the head one, every turn. At 75k that pair cost 9.8 GB of a 32 GB budget to
+//    buy 32 tokens of reprocess, and after any deep turn it WAS the entire surviving cache. The
+//    guard refuses it; the single head checkpoint is placed 32 tokens back instead, so it still
+//    covers a retokenized tail.
+//  - a point is never placed where it would be nearly redundant, so the ladder cannot stack up
+//    at the head.
+static bool smartcache_ladder_worth_writing(int depth, int head_depth)
+{
+    if(depth <= 0)
+    {
+        return false;
+    }
+    return smartcache_ladder_nearest_below(depth) >= smartcache_ladder_gap(head_depth);
+}
+
 //=============================================================================================
 
-//A grid checkpoint is a generation-free snapshot at an absolute depth. It must never
-//land in the head-checkpoint slot or the hard-reserved lifeboat slot, so it cannot use
-//smartcache_quick_snapshot's get_oldest_slot(-1) victim choice.
-static int smartcache_grid_snapshot()
+//A ladder rung is a generation-free snapshot at the depth the conversation has reached. It
+//must never land in the head-checkpoint slot or the hard-reserved lifeboat slot, so it cannot
+//use smartcache_quick_snapshot's get_oldest_slot(-1) victim choice.
+static int smartcache_ladder_snapshot()
 {
     int identical_slot = get_identical_existing_slot();
     if(identical_slot!=-1) //this exact depth is already checkpointed - a retry re-deriving the grid
@@ -6831,31 +6725,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     bool v3_use_scratch = true; //for normal inference always use scratch
     bool rnn_lifeboat_taken = false;
     const int rnn_lifeboat_target = (int)((embd_inp.size() * smartcache_rnn_lifeboat_percent) / 100);
-    const bool rnn_grid_enabled = smartcache_grid_spacing > 0 && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC;
-    //the grid supersedes the lifeboat: it places a checkpoint every G tokens, which is
-    //strictly denser than the single 65%-of-this-prompt point, and at depths that survive an edit.
-    const bool rnn_lifeboat_enabled = !rnn_grid_enabled && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && (int)embd_inp.size() >= smartcache_rnn_lifeboat_min_prompt_tokens;
-    //The depth this prefill ENDS at. Not embd_inp.size(): ContextFastForward has already
-    //trimmed embd_inp to the unmatched suffix and advanced n_past past the shared prefix, so
-    //on an append turn embd_inp is a few dozen tokens while the real head is thousands deep.
-    //Reading the suffix as the head depth makes every held checkpoint look like it is in the
-    //FUTURE, and the thinner - correctly, for the depth it was handed - frees the entire grid.
-    const int rnn_grid_head_depth = n_past + (int)embd_inp.size();
-    if(rnn_grid_enabled)
-    {
-        //Re-solve the budget against THIS prefill's head depth, then thin what has receded.
-        //Recomputed rather than ratcheted, so a shorter conversation gets its density back.
-        //The load for this turn has already happened above, so thinning here cannot pull a
-        //state out from under it.
-        const int grid_head_depth = rnn_grid_head_depth;
-        smartcache_grid_level_offset = smartcache_grid_solve_offset(grid_head_depth);
-        smartcache_grid_thin(grid_head_depth, smartcache_grid_level_offset);
-        //Until two distinct depths have been observed the cost model is an assumption, so aim
-        //at the very next grid line and sample there instead of thinning on a guess.
-        smartcache_grid_next_depth = (smartcache_cost_model_ready()
-            ? smartcache_grid_next_write(n_past, grid_head_depth, smartcache_grid_level_offset)
-            : ((n_past / smartcache_grid_base_spacing) + 1) * smartcache_grid_base_spacing);
-    }
+    const bool rnn_ladder_enabled = smartcache_grid_mode && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC;
+    //the ladder supersedes the lifeboat: a point every N tokens of depth is strictly denser
+    //than the single 65%-of-this-prompt point, and does not move when the prompt does.
+    const bool rnn_lifeboat_enabled = !rnn_ladder_enabled && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && (int)embd_inp.size() >= smartcache_rnn_lifeboat_min_prompt_tokens;
 
     speculative_draft_result draft_results; //only use if drafting was used
     bool draft_used = false;
@@ -6968,8 +6841,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     int32_t decode_status = -1;
                     bool skipdecodelater = false;
 
-                    //if running rnn model in smartcache mode, save progress a little bit before the final PP is done
-                    //this helps solve token boundary mutation issues
+                    //Snapshot 32 tokens before the prefill ends. In ladder mode this IS the head
+                    //checkpoint - one snapshot doing the job the head slot and the separate
+                    //prompt_end-32 boundary rung used to split between them, for half the bytes.
                     if(draft_ctx==nullptr && embd.size()>1 && !startedsampling && input_consumed==embd_inp.size() && input_consumed>64)
                     {
                         if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
@@ -6977,7 +6851,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             if(embd.size()<=48)
                             {
                                 //directly snapshot for a small batch
-                                smartcache_quick_snapshot(rnn_boundary_slot_idx);
+                                smartcache_quick_snapshot(smartcache_grid_mode ? rnn_reusable_slot_idx : rnn_boundary_slot_idx);
                             }
                             else
                             {
@@ -6990,7 +6864,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 {
                                     if(p==parts.size()-1)
                                     {
-                                        smartcache_quick_snapshot(rnn_boundary_slot_idx);
+                                        smartcache_quick_snapshot(smartcache_grid_mode ? rnn_reusable_slot_idx : rnn_boundary_slot_idx);
                                     }
                                     std::vector<gpt_vocab::id> chunk = parts[p];
                                     kcpp_embd_batch smallbatch = kcpp_embd_batch(chunk, temp_past, use_mrope, draft_is_mtp);
@@ -7134,32 +7008,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         }
 
         n_past += embd.size();
-        if(rnn_grid_enabled && !startedsampling && n_past >= smartcache_grid_next_depth && input_consumed < (int)embd_inp.size() && (int)current_context_tokens.size() > 32)
-        {
-            const int grid_head_depth = rnn_grid_head_depth;
-            if(!smartcache_cost_model_ready())
-            {
-                //Free sample: llama_state_get_size is a dry run through the serializer that only
-                //accumulates sizes, so this prices a checkpoint without writing one. Two of these
-                //pin the affine cost model, after which the budget solve is arithmetic.
-                smartcache_note_state_cost(n_past, llama_state_get_size(llama_ctx_v4));
-                smartcache_grid_level_offset = smartcache_grid_solve_offset(grid_head_depth);
-            }
-            if(smartcache_grid_survives(n_past, grid_head_depth, smartcache_grid_level_offset))
-            {
-                int grid_slot = smartcache_grid_snapshot();
-                if(grid_slot!=-1)
-                {
-                    int gridspacing = smartcache_grid_effective_spacing(smartcache_grid_level_offset);
-                    printf("\n[SmartCache Grid: Saved %zu-token checkpoint into slot %d - spacing %d, level %d]\n",
-                           current_context_tokens.size(),grid_slot,gridspacing,
-                           smartcache_grid_level(grid_head_depth-n_past,gridspacing));
-                }
-            }
-            smartcache_grid_next_depth = (smartcache_cost_model_ready()
-                ? smartcache_grid_next_write(n_past, grid_head_depth, smartcache_grid_level_offset)
-                : ((n_past / smartcache_grid_base_spacing) + 1) * smartcache_grid_base_spacing);
-        }
         if(rnn_lifeboat_enabled && !rnn_lifeboat_taken && !startedsampling && n_past >= rnn_lifeboat_target && input_consumed < (int)embd_inp.size())
         {
             int lifeboat_slot = rnn_lifeboat_hard_reserved ? smartcache_quick_snapshot(rnn_lifeboat_slot_idx) : smartcache_quick_snapshot();
@@ -7210,7 +7058,28 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                  //if running rnn model in smartcache mode, save progress before each gen
                 if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
                 {
-                    if(rnn_reusable_slot_idx!=-1)
+                    if(rnn_ladder_enabled)
+                    {
+                        //THE ONLY LADDER WRITE. Once per turn, after the prompt is fully ingested,
+                        //at whatever depth the KV already sits at - never inside the prefill loop,
+                        //never at a computed absolute depth, and never before a prefill (which is
+                        //what let a cancelled turn destroy the old grid). This turn's head
+                        //checkpoint was already taken 32 tokens back and does not count as a
+                        //fallback, so the question here is only whether the conversation has moved
+                        //N tokens past the last DURABLE rung.
+                        const int depth = (int)current_context_tokens.size();
+                        const int nearest = smartcache_ladder_nearest_below(depth); //read BEFORE the write, or it always reads 0
+                        if(smartcache_ladder_worth_writing(depth, depth))
+                        {
+                            int slot = smartcache_ladder_snapshot();
+                            if(slot!=-1)
+                            {
+                                printf("\n[SmartCache Ladder: %d-token checkpoint into slot %d - gap %d, nearest rung was %d back]\n",
+                                       depth, slot, smartcache_ladder_gap(depth), nearest);
+                            }
+                        }
+                    }
+                    else if(rnn_reusable_slot_idx!=-1)
                     {
                         smartcache_quick_snapshot(rnn_reusable_slot_idx);
                     }
@@ -7781,12 +7650,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     {
                         break;
                     }
-                    //land exactly on the grid line, so a checkpoint's depth is a function of the
-                    //conversation and not of where the batch boundaries happened to fall this run
-                    if (smartcache_grid_spacing > 0 && !startedsampling && n_past + (int)embd.size() >= smartcache_grid_next_depth)
-                    {
-                        break;
-                    }
                 }
 
             }
@@ -7914,18 +7777,22 @@ size_t gpttype_save_state_kv(int slot)
         smartcache_note_state_cost((int)current_context_tokens.size(), newsize);
         //evict oldest-first until this snapshot fits the budget. llama_state_get_size is
         //already known here, so the exact cost is priced before anything is committed.
-        while(smartcache_budget_bytes > 0 && total_savestate_bytes + newsize > smartcache_budget_bytes)
+        //Bytes this slot already holds are about to be released by the overwrite, so they must
+        //not be counted against the budget - otherwise rewriting the head checkpoint in place
+        //demands room for two of them and evicts the ladder to get it.
+        size_t replacing = savestates[slot].current_savestate_size;
+        while(smartcache_budget_bytes > 0 && (total_savestate_bytes - replacing) + newsize > smartcache_budget_bytes)
         {
             int victim = get_evictable_slot(slot,-1);
             if(victim==-1)
             {
                 //nothing left that may be freed - allocate anyway rather than fail the request
                 printf("\nSmartCache: over budget (%zu MB + %zu MB > %zu MB) and nothing evictable.\n",
-                       total_savestate_bytes/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
+                       (total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
                 break;
             }
             printf("\nSmartCache: over budget, evicting slot %d (%zu MB held, %zu MB incoming, %zu MB cap).\n",
-                   victim,total_savestate_bytes/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
+                   victim,(total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
             free_savestate_slot(victim, true);
         }
         try {
@@ -8135,9 +8002,9 @@ int get_evictable_slot(int excludeSlotA, int excludeSlotB)
     int slotid = -1;
     for(int i=0;i<savestate_limit;++i)
     {
-        //the two per-turn reserved slots are never victims: the head checkpoint is what makes a
-        //retry cost 0 tokens and the boundary rung caps a retokenized tail at 32, so trading
-        //either away to store one more grid point is a bad deal at any budget
+        //the head checkpoint is never a victim: it is what makes a retry cost 32 tokens instead
+        //of falling all the way to the next rung down, and trading it away to store one more
+        //ladder rung is a bad deal at any budget
         if(i==excludeSlotA || i==excludeSlotB
            || i==rnn_reusable_slot_idx || i==rnn_boundary_slot_idx
            || i==smartcache_protected_slot
@@ -8149,10 +8016,10 @@ int get_evictable_slot(int excludeSlotA, int excludeSlotB)
         {
             continue;
         }
-        //In grid mode, recency is not a meaningful ordering: every grid point is re-derivable, and
-        //a cold prefill writes all of them inside the same second, so last_used ties across the
-        //whole grid and the victim would be arbitrary. Depth is the real ordering - drop the
-        //shallowest, because an edit lands in the tail and is served by the deepest point below it.
+        //In ladder mode, recency is not a meaningful ordering - rungs are written one per turn and
+        //never re-read until an edit needs one, so last_used says nothing. Depth is the ordering:
+        //drop the SHALLOWEST, the oldest part of the conversation and the least likely to be
+        //edited. The dynamic gap is what stops this from walking the whole ladder forward.
         int64_t rank = (smartcache_grid_mode ? (int64_t)savestates[i].savestate_context_tokens.size()
                                              : savestates[i].last_used);
         if(rank < slotage || slotid==-1)
