@@ -5723,6 +5723,36 @@ static int smartcache_ladder_nearest_below(int depth)
     return best;
 }
 
+//The entire cache, in one line, so neither a human nor the harness has to reconstruct it
+//from a stream of write and delete events. Slot, depth, bytes; the head checkpoint marked.
+static void smartcache_ladder_inventory(const char *why)
+{
+    size_t held = 0;
+    int n = 0;
+    std::string items;
+    char buf[96];
+    for(int i=0;i<savestate_limit;++i)
+    {
+        if(savestates[i].current_savestate_buffer.empty())
+        {
+            continue;
+        }
+        ++n;
+        held += savestates[i].current_savestate_size;
+        snprintf(buf,sizeof(buf)," s%d@%zu(%zuMB)%s",i,
+                 savestates[i].savestate_context_tokens.size(),
+                 savestates[i].current_savestate_size/(1024*1024),
+                 (i==rnn_reusable_slot_idx ? "*" : ""));
+        items += buf;
+    }
+    //Name the head slot in the header, not only via the marker: right after a promotion the
+    //head has moved to a slot that is still empty, so it prints no entry to mark and the line
+    //would claim there is no head at all.
+    printf("\n[SmartCache Inventory (%s): %d held, %zu/%zu MB, head=s%d |%s ] * = head\n",
+           why, n, held/(1024*1024), smartcache_budget_bytes/(1024*1024),
+           rnn_reusable_slot_idx, items.c_str());
+}
+
 //THE GUARD. Everything the old retention machine did is replaced by this one question, asked
 //per candidate write: is there already a fallback within N tokens of here?
 //
@@ -5748,36 +5778,11 @@ static bool smartcache_ladder_worth_writing(int depth, int head_depth)
 
 //=============================================================================================
 
-//A ladder rung is a generation-free snapshot at the depth the conversation has reached. It
-//must never land in the head-checkpoint slot or the hard-reserved lifeboat slot, so it cannot
-//use smartcache_quick_snapshot's get_oldest_slot(-1) victim choice.
-static int smartcache_ladder_snapshot()
-{
-    int identical_slot = get_identical_existing_slot();
-    if(identical_slot!=-1) //this exact depth is already checkpointed - a retry re-deriving the grid
-    {
-        touch_slot(identical_slot);
-        return identical_slot;
-    }
-    int nearby_slot = get_nearby_compatible_smartcache_slot();
-    if(nearby_slot!=-1 && nearby_slot!=rnn_reusable_slot_idx && nearby_slot!=rnn_boundary_slot_idx && !(rnn_lifeboat_hard_reserved && nearby_slot==rnn_lifeboat_slot_idx))
-    {
-        if(savestates[nearby_slot].savestate_context_tokens.size() <= current_context_tokens.size())
-        {
-            touch_slot(nearby_slot);
-            return nearby_slot;
-        }
-        gpttype_save_state_kv(nearby_slot);
-        return nearby_slot;
-    }
-    int target = get_target_slot(rnn_reusable_slot_idx,rnn_boundary_slot_idx);
-    if(target==-1)
-    {
-        return -1; //no slot this write is allowed to take - skip the grid point rather than clobber the head
-    }
-    gpttype_save_state_kv(target);
-    return target;
-}
+//No ladder-rung snapshot helper any more. A rung is never written as its own snapshot: the
+//head checkpoint is already a snapshot at the right depth, so earning rung status just means
+//the head stops overwriting that slot and moves to a fresh one. See the promotion in
+//gpttype_generate. Writing a rung instead would have cost a second full-depth state 32 tokens
+//from the head one - the pair this change exists to remove.
 
 int smartcache_quick_snapshot(int specific_slot = -1)
 {
@@ -7060,24 +7065,39 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 {
                     if(rnn_ladder_enabled)
                     {
-                        //THE ONLY LADDER WRITE. Once per turn, after the prompt is fully ingested,
-                        //at whatever depth the KV already sits at - never inside the prefill loop,
-                        //never at a computed absolute depth, and never before a prefill (which is
-                        //what let a cancelled turn destroy the old grid). This turn's head
-                        //checkpoint was already taken 32 tokens back and does not count as a
-                        //fallback, so the question here is only whether the conversation has moved
-                        //N tokens past the last DURABLE rung.
+                        //THE ONLY LADDER DECISION, once per turn, after the prompt is fully
+                        //ingested. It takes NO snapshot: this turn's head checkpoint was already
+                        //written 32 tokens back, and if it has earned rung status the cheapest
+                        //possible way to keep it is to stop overwriting it. Taking a second
+                        //snapshot here instead would put two full-depth states 32 tokens apart,
+                        //which is the defect this whole change exists to remove.
                         const int depth = (int)current_context_tokens.size();
-                        const int nearest = smartcache_ladder_nearest_below(depth); //read BEFORE the write, or it always reads 0
-                        if(smartcache_ladder_worth_writing(depth, depth))
+                        const int headslot = rnn_reusable_slot_idx;
+                        const int headdepth = (headslot>=0 && !savestates[headslot].current_savestate_buffer.empty())
+                            ? (int)savestates[headslot].savestate_context_tokens.size() : 0;
+                        //nearest_below skips the head slot, so this is the distance to the nearest
+                        //DURABLE rung - the head checkpoint cannot vouch for itself.
+                        const int nearest = (headdepth>0 ? smartcache_ladder_nearest_below(headdepth) : 0);
+                        if(headdepth>0 && smartcache_ladder_worth_writing(headdepth, depth))
                         {
-                            int slot = smartcache_ladder_snapshot();
-                            if(slot!=-1)
+                            //Only promote into a genuinely free slot. Taking an occupied one would
+                            //clobber a rung on the next head write, trading a deep point for a
+                            //head-adjacent one - the wrong direction. Eviction frees slots, so
+                            //this is a pause, not a ceiling.
+                            int fresh = get_target_slot(rnn_reusable_slot_idx,-1);
+                            if(fresh!=-1 && savestates[fresh].current_savestate_buffer.empty())
                             {
-                                printf("\n[SmartCache Ladder: %d-token checkpoint into slot %d - gap %d, nearest rung was %d back]\n",
-                                       depth, slot, smartcache_ladder_gap(depth), nearest);
+                                rnn_reusable_slot_idx = fresh;
+                                printf("\n[SmartCache Ladder: promoted slot %d @ depth %d to a durable rung (gap %d, nearest rung %d back); head moves to slot %d]\n",
+                                       headslot, headdepth, smartcache_ladder_gap(depth), nearest, fresh);
+                            }
+                            else
+                            {
+                                printf("\n[SmartCache Ladder: slot %d @ depth %d earned promotion but no free slot; ladder holds]\n",
+                                       headslot, headdepth);
                             }
                         }
+                        smartcache_ladder_inventory("after turn");
                     }
                     else if(rnn_reusable_slot_idx!=-1)
                     {
@@ -7791,8 +7811,12 @@ size_t gpttype_save_state_kv(int slot)
                        (total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
                 break;
             }
-            printf("\nSmartCache: over budget, evicting slot %d (%zu MB held, %zu MB incoming, %zu MB cap).\n",
-                   victim,(total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
+            printf("\nSmartCache: over budget, evicting slot %d @ depth %zu (%zu MB freed; %zu MB held, %zu MB incoming for slot %d @ depth %zu, %zu MB cap).\n",
+                   victim,savestates[victim].savestate_context_tokens.size(),
+                   savestates[victim].current_savestate_size/(1024*1024),
+                   (total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),
+                   slot,current_context_tokens.size(),
+                   smartcache_budget_bytes/(1024*1024));
             free_savestate_slot(victim, true);
         }
         try {
