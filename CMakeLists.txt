@@ -634,3 +634,31 @@ if (LLAMA_HIPBLAS)
     )
 endif()
 
+
+# --- LOCAL DEV ONLY (DP-326): CPU koboldcpp_default.dll ------------------------
+# Upstream's CMakeLists only emits SHARED targets inside the LLAMA_CUBLAS /
+# LLAMA_HIPBLAS blocks, so a CPU-only cmake build produces static libs and no
+# loadable DLL at all -- koboldcpp.py then finds nothing. Upstream expects the
+# Makefile (w64devkit) for CPU builds. This target is a copy of the cublas block
+# with the CUDA libs dropped, purely so the smartcache work can be built and run
+# locally with MSVC. NOT part of the smartcache patch; keep it out of that diff.
+option(LLAMA_BUILD_CPU_DLL "koboldcpp: build the CPU koboldcpp_default shared lib" ON)
+if (LLAMA_BUILD_CPU_DLL AND NOT LLAMA_CUBLAS AND NOT LLAMA_HIPBLAS)
+    set(TARGET koboldcpp_default)
+    add_library(${TARGET} SHARED expose.cpp expose.h)
+    target_include_directories(${TARGET} PUBLIC . ./ggml/include ./ggml/src ./ggml/src/ggml-cpu ./include ./otherarch ./otherarch/tools ./vendor/stb ./vendor/nlohmann ./vendor ./otherarch/sdcpp ./otherarch/sdcpp/thirdparty ./tools ./common)
+    target_compile_features(${TARGET} PUBLIC cxx_std_17) # don't bump
+    set_target_properties(${TARGET} PROPERTIES PREFIX "")
+    set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME "koboldcpp_default")
+    set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(${TARGET} PUBLIC Threads::Threads ggml ggml_v1 ggml_v2 ggml_v3 common2 gpttype_adapter whisper_adapter music_adapter tts_adapter embeddings_adapter sdtype_adapter ${LLAMA_EXTRA_LIBS})
+    target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+    add_custom_command(
+    TARGET koboldcpp_default POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy
+        $<TARGET_FILE:koboldcpp_default>
+        ${CMAKE_SOURCE_DIR}/
+    COMMENT "Copying DLL to parent directory"
+    )
+endif()
