@@ -5689,7 +5689,15 @@ static int smartcache_ladder_capacity(int head_depth)
         return 1;
     }
     double avail = (double)smartcache_budget_bytes - one; //the head checkpoint is not the ladder's to spend
-    int n = (int)(avail / one);
+    //NOT avail/one. That prices every rung as if it sat at the head, and the whole point of a
+    //ladder is that its rungs do not: rung k of n sits at head_depth*k/n and costs
+    //fixed + rate*head_depth*k/n. Summing,  n*fixed + rate*head_depth*(n+1)/2 <= avail,
+    //which is the solve below. The pessimistic form left the budget HALF EMPTY at prod scale
+    //(15161 MB held of 32768) and the resulting gap put the nearest rung 21734 tokens below an
+    //edit at 80% where the shipped grid managed 16004.
+    double half = smartcache_cost_rate * (double)head_depth / 2.0;
+    double per = smartcache_cost_fixed + half;
+    int n = (per > 0.0 ? (int)((avail - half) / per) : 1);
     return (n < 1 ? 1 : n);
 }
 
@@ -5698,7 +5706,10 @@ static int smartcache_ladder_capacity(int head_depth)
 static int smartcache_ladder_gap(int head_depth)
 {
     int cap = smartcache_ladder_capacity(head_depth);
-    int gap = head_depth / cap;
+    //capacity+1 intervals: `cap` rungs plus the head checkpoint. Dividing by cap alone hands
+    //one interval to the head and spreads the rest too thinly - 16301 tokens below an edit at
+    //80% instead of 15048, measured against the grid's 16004.
+    int gap = head_depth / (cap + 1);
     return (gap < smartcache_ladder_min_gap ? smartcache_ladder_min_gap : gap);
 }
 
@@ -6826,6 +6837,16 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         printf("%s\n\n", RemoveBell(outstr).c_str());
     }
 
+    //The depth this turn will END at, known BEFORE ingestion starts. That is what makes
+    //seeding possible: the ladder gap is a function of the head depth, and the head depth is
+    //n_past plus the prompt that is about to be consumed.
+    const int ladder_head_depth = n_past + (int)embd_inp.size();
+    //Where the last seed landed. Starts at the pre-existing depth so the FIRST seed is a
+    //full gap in, not at the first batch boundary: smartcache_ladder_worth_writing answers
+    //"yes" when there is no fallback at all, which on a cold prefill is true at 1024 tokens.
+    //The guard spaces a candidate against existing RUNGS; this spaces the candidates.
+    int ladder_last_seed = n_past;
+
     while (remaining_tokens > 0 && !early_abort)
     {
         gpt_vocab::id id = 0;
@@ -7040,6 +7061,50 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         }
 
         n_past += embd.size();
+
+        //SEEDING A COLD ARRIVAL. Without this, a conversation that arrives deep in one turn
+        //gets exactly one rung - at the head - because you can only snapshot where the KV
+        //sits, and after one turn it sits at the top. Measured on CT101 2026-09-03: an edit
+        //at 80% of a 65k arrival reprocessed 65156 tokens against the shipped grid's 16004,
+        //holding 8446 MB of a 32768 MB budget. Bytes were never the constraint; placement was.
+        //
+        //This is NOT the grid's defect #1, which wrote from inside this loop unconditionally,
+        //answering to no guard and no budget - so a cold prefill wrote five rungs and a normal
+        //turn wrote none. Every candidate here goes through smartcache_ladder_worth_writing,
+        //the same guard the after-turn rule uses, and through gpttype_save_state_kv, the same
+        //budget. The only difference is WHEN it is asked.
+        if(rnn_ladder_enabled && !startedsampling && input_consumed < (int)embd_inp.size())
+        {
+            const int seeddepth = (int)current_context_tokens.size();
+            const int seedgap = smartcache_ladder_gap(ladder_head_depth);
+            //Three conditions: a full gap since the last seed, HALF a gap of headroom below
+            //the head, and the ordinary write guard.
+            //
+            //Half a gap, not a full one, and that is not a fudge. A candidate only exists
+            //where this loop actually is - on a batch boundary. On the very first cold
+            //arrival the cost model has not seen two distinct depths yet, so capacity falls
+            //back to 1 and the gap becomes head/2; requiring a full gap on BOTH sides then
+            //intersects in exactly one token position (15042 of 30084), which a 1024-token
+            //batch steps straight over. Measured on omen 2026-09-03: nothing seeded at all.
+            //The head checkpoint covers the top anyway, and the promotion guard still
+            //refuses to make a rung of anything too close to it.
+            if(seeddepth - ladder_last_seed >= seedgap
+               && ladder_head_depth - seeddepth >= seedgap/2
+               && smartcache_ladder_worth_writing(seeddepth, ladder_head_depth))
+            {
+                //A free slot only. Taking an occupied one would clobber a live rung to store
+                //a shallower one, and eviction is gpttype_save_state_kv's job, under budget.
+                int seedslot = get_target_slot(rnn_reusable_slot_idx,-1);
+                if(seedslot!=-1 && savestates[seedslot].current_savestate_buffer.empty())
+                {
+                    gpttype_save_state_kv(seedslot);
+                    ladder_last_seed = seeddepth;
+                    printf("\n[SmartCache Ladder: seeded slot %d @ depth %d during prefill (gap %d, head %d)]\n",
+                           seedslot, seeddepth, seedgap, ladder_head_depth);
+                }
+            }
+        }
+
         if(rnn_lifeboat_enabled && !rnn_lifeboat_taken && !startedsampling && n_past >= rnn_lifeboat_target && input_consumed < (int)embd_inp.size())
         {
             int lifeboat_slot = rnn_lifeboat_hard_reserved ? smartcache_quick_snapshot(rnn_lifeboat_slot_idx) : smartcache_quick_snapshot();
