@@ -5791,6 +5791,36 @@ static void smartcache_ladder_inventory(const char *why)
            rnn_reusable_slot_idx, items.c_str());
 }
 
+//Distance UP to the nearest live rung above `depth`. INT32_MAX when there is none.
+//
+//The guard used to ask only what was below, which was sufficient while rungs could only ever
+//be created at increasing depth - the head advancing and being promoted. Seeding breaks that
+//assumption: it places rungs ABOVE the current head, so a later promotion can land just under
+//one. Measured on omen 2026-09-03: a promotion at 6625 under a rung seeded at 10240, 3615
+//apart against a 4096 floor, which the harness then reported on all 74 following steps.
+//
+//Evenness is not cosmetic here. smartcache_ladder_capacity assumes the ladder is SPREAD from
+//0 to the head - that is exactly what makes its n*fixed + rate*d*(n+1)/2 bound correct - so a
+//cluster holds more rungs than its coverage is worth and the budget then evicts good ones.
+static int smartcache_ladder_nearest_above(int depth)
+{
+    int best = INT32_MAX;
+    for(int i=0;i<savestate_limit;++i)
+    {
+        if(i==rnn_reusable_slot_idx || savestates[i].current_savestate_buffer.empty()
+           || !smartcache_ladder_rung_live(i))
+        {
+            continue;
+        }
+        int d = (int)savestates[i].savestate_context_tokens.size();
+        if(d > depth && d-depth < best)
+        {
+            best = d-depth;
+        }
+    }
+    return best;
+}
+
 //THE GUARD. Everything the old retention machine did is replaced by this one question, asked
 //per candidate write: is there already a fallback within N tokens of here?
 //
@@ -5811,7 +5841,9 @@ static bool smartcache_ladder_worth_writing(int depth, int head_depth)
     {
         return false;
     }
-    return smartcache_ladder_nearest_below(depth) >= smartcache_ladder_gap(head_depth);
+    const int g = smartcache_ladder_gap(head_depth);
+    return smartcache_ladder_nearest_below(depth) >= g
+        && smartcache_ladder_nearest_above(depth) >= g;
 }
 
 //=============================================================================================
@@ -7073,6 +7105,19 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         //turn wrote none. Every candidate here goes through smartcache_ladder_worth_writing,
         //the same guard the after-turn rule uses, and through gpttype_save_state_kv, the same
         //budget. The only difference is WHEN it is asked.
+        //PRIME THE COST MODEL. capacity() needs two distinct (depth, bytes) observations
+        //before it can size the gap, and on a cold start it has none - so the very first
+        //arrival, the one that most needs seeding, got capacity 1 and a single rung at the
+        //midpoint (51% of edit positions still full-reprocessing, measured on omen).
+        //llama_state_get_size only COMPUTES the serialized size, it does not copy the state,
+        //so priming costs two size queries per cold prefill and no bytes.
+        if(rnn_ladder_enabled && !startedsampling && !smartcache_cost_model_ready()
+           && current_context_tokens.size() > 0 && input_consumed < (int)embd_inp.size())
+        {
+            smartcache_note_state_cost((int)current_context_tokens.size(),
+                                       llama_state_get_size(llama_ctx_v4));
+        }
+
         if(rnn_ladder_enabled && !startedsampling && input_consumed < (int)embd_inp.size())
         {
             const int seeddepth = (int)current_context_tokens.size();
