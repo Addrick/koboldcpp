@@ -5760,35 +5760,90 @@ static int smartcache_ladder_nearest_below(int depth)
     return best;
 }
 
-//The entire cache, in one line, so neither a human nor the harness has to reconstruct it
-//from a stream of write and delete events. Slot, depth, bytes; the head checkpoint marked.
+//The entire cache, formatted in a 4-column grid sorted by depth, so both a human and the harness
+//can easily read it. Slot, depth, bytes; the head checkpoint marked.
 static void smartcache_ladder_inventory(const char *why)
 {
+    struct InventoryItem {
+        int slot;
+        size_t depth;
+        size_t size_mb;
+        bool is_head;
+        bool is_live;
+    };
+
     size_t held = 0;
-    int n = 0;
-    std::string items;
-    char buf[96];
+    std::vector<InventoryItem> items;
     for(int i=0;i<savestate_limit;++i)
     {
         if(savestates[i].current_savestate_buffer.empty())
         {
             continue;
         }
-        ++n;
         held += savestates[i].current_savestate_size;
-        snprintf(buf,sizeof(buf)," s%d@%zu(%zuMB)%s%s",i,
-                 savestates[i].savestate_context_tokens.size(),
-                 savestates[i].current_savestate_size/(1024*1024),
-                 (i==rnn_reusable_slot_idx ? "*" : ""),
-                 (smartcache_ladder_rung_live(i) ? "" : "!"));
-        items += buf;
+        items.push_back({
+            i,
+            savestates[i].savestate_context_tokens.size(),
+            savestates[i].current_savestate_size/(1024*1024),
+            (i==rnn_reusable_slot_idx),
+            smartcache_ladder_rung_live(i)
+        });
     }
+
+    int n = (int)items.size();
+    if(n == 0)
+    {
+        printf("\n[SmartCache Inventory (%s): 0 held, 0/%zu MB, head=s%d | ] * = head, ! = dead\n",
+               why, smartcache_budget_bytes/(1024*1024), rnn_reusable_slot_idx);
+        return;
+    }
+
+    std::sort(items.begin(), items.end(), [](const InventoryItem &a, const InventoryItem &b) {
+        if(a.depth != b.depth)
+        {
+            return a.depth < b.depth;
+        }
+        return a.slot < b.slot;
+    });
+
+    std::string grid;
+    char buf[64];
+    for(size_t i=0; i<items.size(); ++i)
+    {
+        int col = (int)(i % 4);
+        if(col == 0)
+        {
+            grid += "  ";
+        }
+        snprintf(buf, sizeof(buf), "s%d@%zu(%zuMB)%s%s",
+                 items[i].slot, items[i].depth, items[i].size_mb,
+                 (items[i].is_head ? "*" : ""),
+                 (items[i].is_live ? "" : "!"));
+        std::string item_str(buf);
+        if(col < 3 && i + 1 < items.size())
+        {
+            if(item_str.size() < 20)
+            {
+                item_str.append(20 - item_str.size(), ' ');
+            }
+            else
+            {
+                item_str.append("  ");
+            }
+        }
+        grid += item_str;
+        if(col == 3 || i + 1 == items.size())
+        {
+            grid += "\n";
+        }
+    }
+
     //Name the head slot in the header, not only via the marker: right after a promotion the
     //head has moved to a slot that is still empty, so it prints no entry to mark and the line
     //would claim there is no head at all.
-    printf("\n[SmartCache Inventory (%s): %d held, %zu/%zu MB, head=s%d |%s ] * = head, ! = dead\n",
+    printf("\n[SmartCache Inventory (%s): %d held, %zu/%zu MB, head=s%d |\n%s] * = head, ! = dead\n",
            why, n, held/(1024*1024), smartcache_budget_bytes/(1024*1024),
-           rnn_reusable_slot_idx, items.c_str());
+           rnn_reusable_slot_idx, grid.c_str());
 }
 
 //Distance UP to the nearest live rung above `depth`. INT32_MAX when there is none.
