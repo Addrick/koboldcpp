@@ -6927,6 +6927,11 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     //"yes" when there is no fallback at all, which on a cold prefill is true at 1024 tokens.
     //The guard spaces a candidate against existing RUNGS; this spaces the candidates.
     int ladder_last_seed = n_past;
+    //Did THIS TURN write the head checkpoint? Nothing downstream could ask before: promotion
+    //tested only that the head slot was non-empty, so a state left there by an earlier turn
+    //could be pinned as a durable rung while rnn_reusable_slot_idx moved on to an empty slot -
+    //leaving no head checkpoint at all, and after an edit pinning a state that is already dead.
+    bool ladder_head_written = false;
 
     while (remaining_tokens > 0 && !early_abort)
     {
@@ -6978,7 +6983,17 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     //Snapshot 32 tokens before the prefill ends. In ladder mode this IS the head
                     //checkpoint - one snapshot doing the job the head slot and the separate
                     //prompt_end-32 boundary rung used to split between them, for half the bytes.
-                    if(draft_ctx==nullptr && embd.size()>1 && !startedsampling && input_consumed==embd_inp.size() && input_consumed>64)
+                    //GATE ON DEPTH, NOT ON THIS TURN'S NEW TOKENS. embd_inp is POST-fast-forward -
+                    //model_adapter.cpp erases the reused prefix off the front of it - so
+                    //input_consumed>64 asks how much text this turn ADDED, and an ordinary short
+                    //follow-up after 40k of chat adds twenty. In ladder mode that skipped the head
+                    //write; promotion then had nothing to promote and the ladder stopped growing
+                    //for as long as the turns stayed short. tests/test_head_write_gate.py.
+                    //The non-ladder boundary rung keeps the token test: it hedges a PROMPT, not a
+                    //conversation, so "how much arrived" is the right question there.
+                    const bool ladder_head_due = rnn_ladder_enabled && ladder_head_depth > 64;
+                    if(draft_ctx==nullptr && !startedsampling && input_consumed==embd_inp.size()
+                       && (ladder_head_due || (embd.size()>1 && input_consumed>64)))
                     {
                         if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
                         {
@@ -6986,6 +7001,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             {
                                 //directly snapshot for a small batch
                                 smartcache_quick_snapshot(smartcache_grid_mode ? rnn_reusable_slot_idx : rnn_boundary_slot_idx);
+                                ladder_head_written = smartcache_grid_mode;
                             }
                             else
                             {
@@ -6999,6 +7015,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                     if(p==parts.size()-1)
                                     {
                                         smartcache_quick_snapshot(smartcache_grid_mode ? rnn_reusable_slot_idx : rnn_boundary_slot_idx);
+                                        ladder_head_written = smartcache_grid_mode;
                                     }
                                     std::vector<gpt_vocab::id> chunk = parts[p];
                                     kcpp_embd_batch smallbatch = kcpp_embd_batch(chunk, temp_past, use_mrope, draft_is_mtp);
@@ -7261,6 +7278,22 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         //possible way to keep it is to stop overwriting it. Taking a second
                         //snapshot here instead would put two full-depth states 32 tokens apart,
                         //which is the defect this whole change exists to remove.
+                        //THE BACKSTOP. The write above is placed 32 tokens before the end of the
+                        //prefill, which needs a decode to hook onto - and a turn whose prompt is
+                        //entirely cached decodes nothing at all. The recurrent path fast-forwards
+                        //with minimum_input_to_keep=0, so embd_inp really can come out empty; the
+                        //"reloading from a perfectly matched state" logits fallback further down
+                        //exists for exactly that turn. There is no "32 tokens back" moment on it,
+                        //so take the head at full depth here instead. quick_snapshot on the NAMED
+                        //slot dedups against itself, so an unchanged retry costs a touch rather
+                        //than a full-depth serialize.
+                        if(!ladder_head_written && draft_ctx==nullptr && rnn_reusable_slot_idx!=-1)
+                        {
+                            smartcache_quick_snapshot(rnn_reusable_slot_idx);
+                            ladder_head_written = true;
+                            printf("\n[SmartCache Ladder: head checkpoint taken at full depth %zu (nothing decoded this turn)]\n",
+                                   current_context_tokens.size());
+                        }
                         const int depth = (int)current_context_tokens.size();
                         const int headslot = rnn_reusable_slot_idx;
                         const int headdepth = (headslot>=0 && !savestates[headslot].current_savestate_buffer.empty())
@@ -7268,7 +7301,18 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         //nearest_below skips the head slot, so this is the distance to the nearest
                         //DURABLE rung - the head checkpoint cannot vouch for itself.
                         const int nearest = (headdepth>0 ? smartcache_ladder_nearest_below(headdepth) : 0);
-                        if(headdepth>0 && smartcache_ladder_worth_writing(headdepth, depth))
+                        //REFUSE A HEAD THIS TURN DID NOT WRITE. worth_writing cannot cover this:
+                        //nearest_below and nearest_above both skip the head slot by construction,
+                        //so it structurally cannot liveness-test the head. What is left is a
+                        //draft/speculative model, where the write above is skipped because the
+                        //snapshot does not carry the draft context - the ladder is then built by
+                        //seeding alone, rather than by pinning whatever the head slot still holds.
+                        if(headdepth>0 && !ladder_head_written)
+                        {
+                            printf("\n[SmartCache Ladder: head slot %d @ depth %d was not written this turn; not promoting a stale head]\n",
+                                   headslot, headdepth);
+                        }
+                        else if(headdepth>0 && smartcache_ladder_worth_writing(headdepth, depth))
                         {
                             //Only promote into a genuinely free slot. Taking an occupied one would
                             //clobber a rung on the next head write, trading a deep point for a
