@@ -5846,6 +5846,47 @@ static bool smartcache_ladder_worth_writing(int depth, int head_depth)
         && smartcache_ladder_nearest_above(depth) >= g;
 }
 
+//WHERE DOES A NEW RUNG GO? A genuinely free slot, or a dead one reclaimed on the spot. -1 when
+//the ladder must hold - which is a pause, not a ceiling, since the byte budget frees slots too.
+//
+//THE SCARCE RESOURCE IS THE POOL, NOT THE BUDGET, and until this existed nothing reclaimed it on
+//demand: get_evictable_slot already orders dead before live, but it is reached from exactly one
+//place, the byte-budget loop inside gpttype_save_state_kv. Bytes and slots run out
+//independently -- dead rungs are individually cheap, so the pool fills with them while the
+//budget is nowhere near binding, and the ladder simply stops advancing. Measured on omen
+//2026-09-08 over a 13-phase sweep: 9 promotions refused for "no free slot" against 11 that
+//landed, while 16 of 17 slots held DEAD rungs and all 26 budget evictions had picked victim=dead.
+//
+//A DEAD VICTIM ONLY. Trading a live rung for a new one is not obviously a win, and genuine byte
+//pressure is already the budget loop's job.
+//
+//Both the after-turn promotion and the mid-prefill seed call this, because both starve the same
+//way. Note what that means for a seed: liveness is judged against a context that is still
+//arriving, so a rung belonging to a conversation we have swapped away from reads as dead and can
+//be reclaimed by a prefill that may yet abort. That is the same class of action the budget loop
+//inside gpttype_save_state_kv already takes on a seed write - it too picks dead-first victims
+//while the prompt is still ingesting - so this widens WHEN it happens, not WHAT can happen.
+//Bounding it properly means making seeds provisional until the turn completes; that is a
+//separate change, and until it lands the "an aborted turn leaves the ladder untouched" claim in
+//this file's header comment is aspirational rather than true.
+static int smartcache_acquire_rung_slot(const char *why)
+{
+    int fresh = get_target_slot(rnn_reusable_slot_idx,-1);
+    if(fresh!=-1 && savestates[fresh].current_savestate_buffer.empty())
+    {
+        return fresh;
+    }
+    int victim = get_evictable_slot(rnn_reusable_slot_idx,-1);
+    if(victim!=-1 && !smartcache_ladder_rung_live(victim))
+    {
+        printf("\n[SmartCache Ladder: reclaimed dead slot %d @ depth %zu so %s could proceed]\n",
+               victim, savestates[victim].savestate_context_tokens.size(), why);
+        free_savestate_slot(victim, true);
+        return victim;
+    }
+    return -1;
+}
+
 //=============================================================================================
 
 //No ladder-rung snapshot helper any more. A rung is never written as its own snapshot: the
@@ -5854,42 +5895,50 @@ static bool smartcache_ladder_worth_writing(int depth, int head_depth)
 //gpttype_generate. Writing a rung instead would have cost a second full-depth state 32 tokens
 //from the head one - the pair this change exists to remove.
 
+//HONOUR specific_slot. A caller that names a slot is naming the ONE slot that has to end up
+//holding this state - in ladder mode that is the head checkpoint - and an identical state
+//parked in some other slot does not satisfy that. Deduping to it left the NAMED slot empty:
+//right after a promotion the promoted rung IS the identical context, so a same-depth retry
+//touched the rung, the head slot stayed empty, and the next turn read headdepth==0 and refused
+//to promote. That is the HEAD-INVIOLATE invariant, broken by a dedup meant for the swap pool.
+//
+//Deduping is still right when the identical slot IS the named one. That is a retry against an
+//unchanged head, where a rewrite would spend a full-depth serialize to reproduce the bytes
+//already sitting there.
+//
+//The specific_slot==-1 path is unchanged: identical, then nearby-compatible, then oldest.
 int smartcache_quick_snapshot(int specific_slot = -1)
 {
     int identical_slot = get_identical_existing_slot();
-    if(identical_slot==-1)
+    if(specific_slot!=-1)
     {
-        if(specific_slot==-1)
+        if(identical_slot==specific_slot)
         {
-            int nearby_slot = get_nearby_compatible_smartcache_slot();
-            if(nearby_slot!=-1)
-            {
-                if(savestates[nearby_slot].savestate_context_tokens.size() <= current_context_tokens.size())
-                {
-                    touch_slot(nearby_slot);
-                    return nearby_slot;
-                }
-                gpttype_save_state_kv(nearby_slot);
-                return nearby_slot;
-            }
-        }
-        if(specific_slot!=-1)
-        {
-            gpttype_save_state_kv(specific_slot);
+            touch_slot(specific_slot);
             return specific_slot;
         }
-        else
-        {
-            int oldest_slot = get_oldest_slot(-1);
-            gpttype_save_state_kv(oldest_slot);
-            return oldest_slot;
-        }
+        gpttype_save_state_kv(specific_slot);
+        return specific_slot;
     }
-    else
+    if(identical_slot!=-1)
     {
         touch_slot(identical_slot);
         return identical_slot;
     }
+    int nearby_slot = get_nearby_compatible_smartcache_slot();
+    if(nearby_slot!=-1)
+    {
+        if(savestates[nearby_slot].savestate_context_tokens.size() <= current_context_tokens.size())
+        {
+            touch_slot(nearby_slot);
+            return nearby_slot;
+        }
+        gpttype_save_state_kv(nearby_slot);
+        return nearby_slot;
+    }
+    int oldest_slot = get_oldest_slot(-1);
+    gpttype_save_state_kv(oldest_slot);
+    return oldest_slot;
 }
 
 generation_outputs gpttype_generate(const generation_inputs inputs)
@@ -7137,9 +7186,13 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                && ladder_head_depth - seeddepth >= seedgap/2
                && smartcache_ladder_worth_writing(seeddepth, ladder_head_depth))
             {
-                //A free slot only. Taking an occupied one would clobber a live rung to store
-                //a shallower one, and eviction is gpttype_save_state_kv's job, under budget.
-                int seedslot = get_target_slot(rnn_reusable_slot_idx,-1);
+                //A free slot, or a dead one reclaimed. Never a live rung: taking an occupied one
+                //would clobber live history to store a shallower point, and byte pressure is
+                //gpttype_save_state_kv's job. Seeding starves on the POOL exactly the way
+                //promotion did, so it uses the same acquire - the pool-starvation fix landing on
+                //only one of the two paths left a cold arrival into a pool of dead rungs seeding
+                //nothing at all.
+                int seedslot = smartcache_acquire_rung_slot("a prefill seed");
                 if(seedslot!=-1 && savestates[seedslot].current_savestate_buffer.empty())
                 {
                     gpttype_save_state_kv(seedslot);
@@ -7221,7 +7274,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             //clobber a rung on the next head write, trading a deep point for a
                             //head-adjacent one - the wrong direction. Eviction frees slots, so
                             //this is a pause, not a ceiling.
-                            int fresh = get_target_slot(rnn_reusable_slot_idx,-1);
+                            int fresh = smartcache_acquire_rung_slot("a promotion");
                             if(fresh!=-1 && savestates[fresh].current_savestate_buffer.empty())
                             {
                                 rnn_reusable_slot_idx = fresh;
@@ -7932,20 +7985,24 @@ size_t gpttype_save_state_kv(int slot)
         size_t newsize = llama_state_get_size(llama_ctx_v4);
         //every real snapshot is a free observation for the cost model the grid budget solves against
         smartcache_note_state_cost((int)current_context_tokens.size(), newsize);
-        //evict oldest-first until this snapshot fits the budget. llama_state_get_size is
-        //already known here, so the exact cost is priced before anything is committed.
-        //Bytes this slot already holds are about to be released by the overwrite, so they must
-        //not be counted against the budget - otherwise rewriting the head checkpoint in place
-        //demands room for two of them and evicts the ladder to get it.
-        size_t replacing = savestates[slot].current_savestate_size;
-        while(smartcache_budget_bytes > 0 && (total_savestate_bytes - replacing) + newsize > smartcache_budget_bytes)
+        //Evict until this snapshot fits the budget. llama_state_get_size is already known here,
+        //so the exact cost is priced before anything is committed.
+        //
+        //total_savestate_bytes NO LONGER INCLUDES THIS SLOT: the JIT free at the top of this
+        //function already released its buffers and decremented the total. That is what stops
+        //rewriting the head checkpoint in place from demanding room for two of them and evicting
+        //the ladder to get it. There used to be a `replacing` term here subtracting the slot's
+        //old size for the same reason - it was dead, always zero, because the JIT free had
+        //already zeroed current_savestate_size several lines above. The arithmetic was right;
+        //the mechanism named in the comment was not the one running.
+        while(smartcache_budget_bytes > 0 && total_savestate_bytes + newsize > smartcache_budget_bytes)
         {
             int victim = get_evictable_slot(slot,-1);
             if(victim==-1)
             {
                 //nothing left that may be freed - allocate anyway rather than fail the request
                 printf("\nSmartCache: over budget (%zu MB + %zu MB > %zu MB) and nothing evictable.\n",
-                       (total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
+                       total_savestate_bytes/(1024*1024),newsize/(1024*1024),smartcache_budget_bytes/(1024*1024));
                 break;
             }
             //Say whether the victim was reachable, and how many unreachable rungs were on the
@@ -7966,7 +8023,7 @@ size_t gpttype_save_state_kv(int slot)
                    victim,savestates[victim].savestate_context_tokens.size(),
                    (smartcache_ladder_rung_live(victim) ? "live" : "dead"), deadheld,
                    savestates[victim].current_savestate_size/(1024*1024),
-                   (total_savestate_bytes-replacing)/(1024*1024),newsize/(1024*1024),
+                   total_savestate_bytes/(1024*1024),newsize/(1024*1024),
                    slot,current_context_tokens.size(),
                    smartcache_budget_bytes/(1024*1024));
             free_savestate_slot(victim, true);
