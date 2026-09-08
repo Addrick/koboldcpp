@@ -5941,6 +5941,89 @@ int smartcache_quick_snapshot(int specific_slot = -1)
     return oldest_slot;
 }
 
+//TAKE THIS TURN'S HEAD CHECKPOINT. Returns LADDER_HEAD_WRITTEN when the head slot now holds
+//it, LADDER_HEAD_COVERED when some other slot already did and was touched instead.
+//
+//A RETRY RE-DERIVES A STATE A RUNG ALREADY HOLDS. Right after a promotion the promoted rung
+//IS this exact depth and the head slot is deliberately empty, so honouring the named slot -
+//which is what HEAD-INVIOLATE asks for, and what smartcache_quick_snapshot was fixed to do -
+//spends a full-depth serialize to duplicate a checkpoint sitting one slot away. Measured on
+//omen 2026-09-08 at 25k: three retries, three 552 MB writes, the same depth held twice, and
+//tests/sweep.py's retry phase (which asserts a retry touches nothing) red on all three.
+//That is the exact cost the write guard exists to refuse; it only became reachable when the
+//head write started firing on turns that decode fewer than 64 new tokens.
+//
+//Deduping to another slot is safe HERE in a way it was not before the write-gate change:
+//promotion now refuses a head this turn did not write, so an empty head slot can no longer
+//be misread as a stale state to pin, and the caller keeps the two cases apart rather than
+//calling a dedup a write. What the invariant actually needs is a resumable checkpoint AT the
+//head depth - not that particular slot.
+//IDENTITY AT THE DEPTH THE KV IS ACTUALLY AT, which is not the depth current_context_tokens
+//claims. The head write fires 32 tokens before the end of the prefill, and by then the token
+//vector already holds the WHOLE prompt while the KV is still those 32 tokens behind.
+//gpttype_save_state_kv silently reconciles that on the way in - the "SaveState inconsistency
+//fix" trims the stored label down to maxedpos+2 - so every rung on disk carries the TRIMMED
+//depth while the live vector carries the untrimmed one.
+//
+//get_identical_existing_slot() compares sizes first, so from this call site it can never
+//match anything: measured on omen 2026-09-08, ctx=25079 against slots holding 25048,
+//identical=-1 on all three retries. The dedup inside smartcache_quick_snapshot has therefore
+//never been reachable from here either - it was written against a call site whose vector is
+//already consistent. This asks the question at the depth the save will actually record.
+static int smartcache_identical_slot_at_kv_depth()
+{
+    int maxedpos = llama_memory_seq_pos_max(llama_get_memory(llama_ctx_v4),0);
+    size_t effective = current_context_tokens.size();
+    if(maxedpos > 0 && effective > (size_t)(maxedpos + 2))
+    {
+        effective = (size_t)(maxedpos + 2);
+    }
+    if(effective == 0)
+    {
+        return -1;
+    }
+    for(int i=0;i<savestate_limit;++i)
+    {
+        if(savestates[i].savestate_context_tokens.size() != effective
+           || savestates[i].media_signature != media_composite_image_signature)
+        {
+            continue;
+        }
+        bool same = true;
+        for(size_t j=0;j<effective;++j)
+        {
+            if(savestates[i].savestate_context_tokens[j] != current_context_tokens[j])
+            {
+                same = false;
+                break;
+            }
+        }
+        if(same)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+#define LADDER_HEAD_WRITTEN 1
+#define LADDER_HEAD_COVERED 2
+static int smartcache_ladder_take_head()
+{
+    int existing = smartcache_identical_slot_at_kv_depth();
+    if(existing!=-1)
+    {
+        //Already on disk, byte for byte. Touching it is the whole write. When it is the head
+        //slot itself this is an unchanged retry against a head that is still current, which
+        //may still be promoted; when it is a rung, the ladder already has a point at this
+        //depth and there is nothing left to promote.
+        touch_slot(existing);
+        return (existing==rnn_reusable_slot_idx) ? LADDER_HEAD_WRITTEN : LADDER_HEAD_COVERED;
+    }
+    smartcache_quick_snapshot(rnn_reusable_slot_idx);
+    return LADDER_HEAD_WRITTEN;
+}
+
 generation_outputs gpttype_generate(const generation_inputs inputs)
 {
     BatchLegacyGuard batch_legacy_guard;
@@ -6932,6 +7015,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     //could be pinned as a durable rung while rnn_reusable_slot_idx moved on to an empty slot -
     //leaving no head checkpoint at all, and after an edit pinning a state that is already dead.
     bool ladder_head_written = false;
+    //...or already held by a durable rung, which a retry re-derives exactly. Kept apart from
+    //`written` because only a write may be promoted: a dedup means the ladder already has a
+    //point at this depth, so there is nothing to pin and nothing to warn about.
+    bool ladder_head_covered = false;
 
     while (remaining_tokens > 0 && !early_abort)
     {
@@ -7000,8 +7087,16 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                             if(embd.size()<=48)
                             {
                                 //directly snapshot for a small batch
-                                smartcache_quick_snapshot(smartcache_grid_mode ? rnn_reusable_slot_idx : rnn_boundary_slot_idx);
-                                ladder_head_written = smartcache_grid_mode;
+                                if(smartcache_grid_mode)
+                                {
+                                    int taken = smartcache_ladder_take_head();
+                                    ladder_head_written = (taken==LADDER_HEAD_WRITTEN);
+                                    ladder_head_covered = (taken==LADDER_HEAD_COVERED);
+                                }
+                                else
+                                {
+                                    smartcache_quick_snapshot(rnn_boundary_slot_idx);
+                                }
                             }
                             else
                             {
@@ -7014,8 +7109,16 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 {
                                     if(p==parts.size()-1)
                                     {
-                                        smartcache_quick_snapshot(smartcache_grid_mode ? rnn_reusable_slot_idx : rnn_boundary_slot_idx);
-                                        ladder_head_written = smartcache_grid_mode;
+                                        if(smartcache_grid_mode)
+                                        {
+                                            int taken = smartcache_ladder_take_head();
+                                            ladder_head_written = (taken==LADDER_HEAD_WRITTEN);
+                                            ladder_head_covered = (taken==LADDER_HEAD_COVERED);
+                                        }
+                                        else
+                                        {
+                                            smartcache_quick_snapshot(rnn_boundary_slot_idx);
+                                        }
                                     }
                                     std::vector<gpt_vocab::id> chunk = parts[p];
                                     kcpp_embd_batch smallbatch = kcpp_embd_batch(chunk, temp_past, use_mrope, draft_is_mtp);
@@ -7287,7 +7390,8 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         //so take the head at full depth here instead. quick_snapshot on the NAMED
                         //slot dedups against itself, so an unchanged retry costs a touch rather
                         //than a full-depth serialize.
-                        if(!ladder_head_written && draft_ctx==nullptr && rnn_reusable_slot_idx!=-1)
+                        if(!ladder_head_written && !ladder_head_covered
+                           && draft_ctx==nullptr && rnn_reusable_slot_idx!=-1)
                         {
                             smartcache_quick_snapshot(rnn_reusable_slot_idx);
                             ladder_head_written = true;
@@ -7309,8 +7413,14 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                         //seeding alone, rather than by pinning whatever the head slot still holds.
                         if(headdepth>0 && !ladder_head_written)
                         {
-                            printf("\n[SmartCache Ladder: head slot %d @ depth %d was not written this turn; not promoting a stale head]\n",
-                                   headslot, headdepth);
+                            //A COVERED head is not a stale one: some rung already holds this
+                            //turn's head point, so there is nothing to pin and nothing to warn
+                            //about. Only an absent write is worth a line.
+                            if(!ladder_head_covered)
+                            {
+                                printf("\n[SmartCache Ladder: head slot %d @ depth %d was not written this turn; not promoting a stale head]\n",
+                                       headslot, headdepth);
+                            }
                         }
                         else if(headdepth>0 && smartcache_ladder_worth_writing(headdepth, depth))
                         {
