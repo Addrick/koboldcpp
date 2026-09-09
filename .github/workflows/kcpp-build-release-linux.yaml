@@ -23,7 +23,7 @@ jobs:
     runs-on: [self-hosted, Linux, ct100]
     permissions: write-all
     container:
-      image: ubuntu:20.04
+      image: kcpp-build:20.04
       options: --privileged
     steps:
       - name: Clone
@@ -35,17 +35,6 @@ jobs:
       - name: Show Commit Used
         run: |
           echo "Building from ref: ${{ inputs.commit_hash != '' && inputs.commit_hash || github.head_ref || github.ref_name }}"
-
-      - name: Dependencies
-        id: depends
-        run: |
-          apt-get update
-          apt-get install -y sudo
-          export DEBIAN_FRONTEND=noninteractive
-          sudo ln -fs /usr/share/zoneinfo/UTC /etc/localtime
-          echo "tzdata tzdata/Areas select Etc" | sudo debconf-set-selections
-          echo "tzdata tzdata/Zones/Etc select UTC" | sudo debconf-set-selections
-          sudo apt-get -y install git curl bzip2 python3-tk tcl tk
 
       - name: Set Tcl/Tk Paths
         run: |
@@ -68,18 +57,6 @@ jobs:
         with:
           name: kcpp_linux_binary
           path: dist/
-
-      - name: Install GitHub CLI
-        run: |
-          apt-get update
-          apt-get install -y curl
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-            | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-            | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          apt-get update
-          apt-get install -y gh
 
       - name: Upload to GitHub Rolling Release
         env:
