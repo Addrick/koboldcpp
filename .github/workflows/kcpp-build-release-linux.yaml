@@ -27,10 +27,39 @@ env:
   ARCHES_CU12: 0
 
 jobs:
+  # JOB 1: Quiesce CT101 before building to free all smartcache slots and RAM.
+  # CT101 has a 48 GiB cap and accumulates 30-40+ GiB of smartcache slots in RAM.
+  # Stopping the unit flushes 100% of heap cache slots, guaranteeing CT100's build
+  # uncontended physical host RAM on the 64 GiB box. The unit is restarted with
+  # the fresh binary in the deploy job.
+  quiesce:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.commit_hash == '')
+    runs-on: [self-hosted, Linux, ct101]
+    timeout-minutes: 5
+    steps:
+      - name: Quiesce active koboldcpp service on CT101
+        run: |
+          set -euo pipefail
+          units=$(systemctl list-units --no-legend --no-pager --state=active --type=service 'koboldcpp-*' 2>/dev/null | awk '{print $1}' || true)
+          if [ -n "$units" ]; then
+            echo "$units" > /run/kcpp-quiesced-units
+            for u in $units; do
+              echo "Quiescing $u before CI build to free smartcache slots and RAM..."
+              systemctl stop "$u"
+            done
+            echo "CT101 quiesced. Memory and VRAM fully released to host."
+          else
+            echo "No active koboldcpp units on CT101."
+            rm -f /run/kcpp-quiesced-units
+          fi
+
+  # JOB 2: Build on CT100 (Ryzen 12-core)
   linux:
+    needs: quiesce
+    if: always() && (needs.quiesce.result == 'success' || needs.quiesce.result == 'skipped')
     runs-on: [self-hosted, Linux, ct100]
     permissions: write-all
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - name: Clone
         id: checkout
@@ -41,6 +70,22 @@ jobs:
       - name: Show Commit Used
         run: |
           echo "Building from ref: ${{ inputs.commit_hash != '' && inputs.commit_hash || github.head_ref || github.ref_name }}"
+
+      # Restore conda environment and micromamba binary from local runner cache
+      # to avoid paying the ~60s `micromamba create` penalty on every clean clone.
+      - name: Restore toolchain cache
+        run: |
+          set -euo pipefail
+          cache_dir="/opt/actions-runner-kcpp/_cache"
+          if [ -f "$cache_dir/bin/micromamba" ]; then
+            mkdir -p bin
+            cp -p "$cache_dir/bin/micromamba" bin/micromamba
+          fi
+          if [ -d "$cache_dir/conda/envs/linux" ]; then
+            mkdir -p conda
+            ln -sfn "$cache_dir/conda/envs" conda/envs
+            echo "Restored conda environment from runner cache."
+          fi
 
       # environment-nocuda.yaml supplies the compiler, make, ninja, tk and
       # pyinstaller, so the host only has to provide what runs *before* the conda
@@ -194,21 +239,61 @@ jobs:
           fi
           gh release upload rolling dist/koboldcpp-linux-x64-nocuda --clobber --repo ${{ github.repository }}
 
-  # JOB 2: Deploy to CT101 (:5001) via self-hosted runner
+      # Save the newly prepared conda env to the runner host cache if not already cached.
+      - name: Update toolchain cache
+        if: success()
+        run: |
+          set -euo pipefail
+          cache_dir="/opt/actions-runner-kcpp/_cache"
+          if [ ! -f "$cache_dir/bin/micromamba" ] && [ -f bin/micromamba ]; then
+            mkdir -p "$cache_dir/bin"
+            cp -p bin/micromamba "$cache_dir/bin/micromamba"
+          fi
+          if [ ! -L conda/envs ] && [ -d conda/envs/linux ]; then
+            mkdir -p "$cache_dir/conda"
+            cp -a conda/envs "$cache_dir/conda/"
+            sha256sum environment-nocuda.yaml | awk '{print $1}' > "$cache_dir/env_hash"
+            echo "Populated runner toolchain cache."
+          fi
+
+  # JOB 3: Deploy to CT101 (:5001) via self-hosted runner
   # Runs on push to main/deploy, or manual workflow_dispatch.
   deploy:
-    needs: linux
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.commit_hash == '')
+    needs: [quiesce, linux]
+    if: always() && needs.quiesce.result == 'success' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.commit_hash == ''))
     runs-on: [self-hosted, Linux, ct101]
     timeout-minutes: 20
     steps:
+      - name: Restore quiesced service on build failure
+        if: needs.linux.result != 'success'
+        run: |
+          echo "Build did not succeed (${{ needs.linux.result }}); restoring quiesced service on CT101..."
+          if [ -s /run/kcpp-quiesced-units ]; then
+            for u in $(cat /run/kcpp-quiesced-units); do
+              echo "Restoring $u"
+              systemctl start "$u" || true
+            done
+            rm -f /run/kcpp-quiesced-units
+          fi
+          exit 1
+
       - name: Fetch and stage rolling binary
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: /opt/kcpp-ops/fetch-rolling.py --force
 
       - name: Cut over and bounce :5001
-        run: /opt/kcpp-ops/cutover.sh --apply staged
+        run: |
+          /opt/kcpp-ops/cutover.sh --apply staged
+          # Safety fallback if /run/kcpp-quiesced-units was not cleared by cutover.sh
+          if [ -s /run/kcpp-quiesced-units ]; then
+            for u in $(cat /run/kcpp-quiesced-units); do
+              echo "Starting quiesced unit: $u"
+              systemctl start "$u"
+            done
+            rm -f /run/kcpp-quiesced-units
+            sleep 5
+          fi
 
       - name: Verify driver VRAM residency
         run: |
