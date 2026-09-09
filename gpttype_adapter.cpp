@@ -5926,11 +5926,6 @@ static bool smartcache_ladder_worth_writing(int depth, int head_depth)
 //this file's header comment is aspirational rather than true.
 static int smartcache_acquire_rung_slot(const char *why)
 {
-    int fresh = get_target_slot(rnn_reusable_slot_idx,-1);
-    if(fresh!=-1 && savestates[fresh].current_savestate_buffer.empty())
-    {
-        return fresh;
-    }
     int victim = get_evictable_slot(rnn_reusable_slot_idx,-1);
     if(victim!=-1 && !smartcache_ladder_rung_live(victim))
     {
@@ -5938,6 +5933,11 @@ static int smartcache_acquire_rung_slot(const char *why)
                victim, savestates[victim].savestate_context_tokens.size(), why);
         free_savestate_slot(victim, true);
         return victim;
+    }
+    int fresh = get_target_slot(rnn_reusable_slot_idx,-1);
+    if(fresh!=-1 && savestates[fresh].current_savestate_buffer.empty())
+    {
+        return fresh;
     }
     return -1;
 }
@@ -6059,6 +6059,20 @@ static int smartcache_identical_slot_at_kv_depth()
         }
     }
     return -1;
+}
+
+#define LADDER_HEAD_WRITTEN 1
+#define LADDER_HEAD_COVERED 2
+static int smartcache_ladder_take_head()
+{
+    int existing = smartcache_identical_slot_at_kv_depth();
+    if(existing!=-1)
+    {
+        touch_slot(existing);
+        return (existing==rnn_reusable_slot_idx) ? LADDER_HEAD_WRITTEN : LADDER_HEAD_COVERED;
+    }
+    gpttype_save_state_kv(rnn_reusable_slot_idx);
+    return LADDER_HEAD_WRITTEN;
 }
 
 
@@ -7308,6 +7322,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             if (!startedsampling)
             {
                 startedsampling = true;
+                if(rnn_ladder_enabled && current_context_tokens.size() > 32)
+                {
+                    smartcache_ladder_take_head();
+                }
                 if(draft_spec)
                 {
                     llama_tokens prompt_tokens;
@@ -7902,48 +7920,32 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         delayed_generated_tokens.pop_front();
     }
 
-    // THE ONLY WRITE: writes only take place after a generation finishes, and only once.
     if(!early_abort && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
     {
         if(rnn_ladder_enabled)
         {
-            int identical_slot = smartcache_identical_slot_at_kv_depth();
-            if(identical_slot != -1)
-            {
-                touch_slot(identical_slot);
-            }
-            else
-            {
-                const int depth = (int)current_context_tokens.size();
-                const int headslot = rnn_reusable_slot_idx;
-                const int headdepth = (headslot >= 0 && !savestates[headslot].current_savestate_buffer.empty())
-                    ? (int)savestates[headslot].savestate_context_tokens.size() : 0;
-                const int nearest = (headdepth > 0 ? smartcache_ladder_nearest_below(headdepth) : 0);
+            const int depth = (int)current_context_tokens.size();
+            const int headslot = rnn_reusable_slot_idx;
+            const int headdepth = (headslot >= 0 && !savestates[headslot].current_savestate_buffer.empty())
+                ? (int)savestates[headslot].savestate_context_tokens.size() : 0;
+            const int nearest = (headdepth > 0 ? smartcache_ladder_nearest_below(headdepth) : 0);
 
-                if(headdepth > 0 && headdepth < depth && smartcache_ladder_rung_live(headslot) && smartcache_ladder_worth_writing(headdepth, depth))
+            if(headdepth > 0 && headdepth < depth && smartcache_ladder_rung_live(headslot) && smartcache_ladder_worth_writing(headdepth, depth))
+            {
+                int fresh = smartcache_acquire_rung_slot("a promotion");
+                if(fresh != -1 && savestates[fresh].current_savestate_buffer.empty())
                 {
-                    int fresh = smartcache_acquire_rung_slot("a promotion");
-                    if(fresh != -1 && savestates[fresh].current_savestate_buffer.empty())
-                    {
-                        rnn_reusable_slot_idx = fresh;
-                        printf("\n[SmartCache Ladder: promoted slot %d @ depth %d to a durable rung (gap %d, nearest rung %d back); head moves to slot %d]\n",
-                               headslot, headdepth, smartcache_ladder_gap(depth), nearest, fresh);
-                    }
-                    else
-                    {
-                        printf("\n[SmartCache Ladder: slot %d @ depth %d earned promotion but no free slot; ladder holds]\n",
-                               headslot, headdepth);
-                    }
+                    rnn_reusable_slot_idx = fresh;
+                    printf("\n[SmartCache Ladder: promoted slot %d @ depth %d to a durable rung (gap %d, nearest rung %d back); head moves to slot %d]\n",
+                           headslot, headdepth, smartcache_ladder_gap(depth), nearest, fresh);
                 }
-                else if(headdepth > 0 && !smartcache_ladder_rung_live(headslot))
+                else
                 {
-                    printf("\n[SmartCache Ladder: head slot %d @ depth %d is dead relative to current context; overwriting rather than promoting]\n",
+                    printf("\n[SmartCache Ladder: slot %d @ depth %d earned promotion but no free slot; ladder holds]\n",
                            headslot, headdepth);
                 }
-
-                gpttype_save_state_kv(rnn_reusable_slot_idx);
-                smartcache_ladder_inventory("after turn");
             }
+            smartcache_ladder_inventory("after turn");
         }
         else if(rnn_reusable_slot_idx != -1)
         {
