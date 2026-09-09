@@ -4,23 +4,25 @@ if [ ! -f "bin/micromamba" ]; then
 	curl -Ls https://anaconda.org/conda-forge/micromamba/1.5.3/download/linux-64/micromamba-1.5.3-0.tar.bz2 | tar -xvj bin/micromamba
 fi
 
-if [[ ! -f "conda/envs/linux/bin/python" && $KCPP_CUDA != "rocm" || $1 == "rebuild" && $KCPP_CUDA != "rocm" ]]; then
-	cp environment.yaml environment.tmp.yaml
-	if [ -n "$KCPP_CUDA" ]; then
-		sed -i -e "s/nvidia\/label\/cuda-12.1.0/nvidia\/label\/cuda-$KCPP_CUDA/g" environment.tmp.yaml
-	else
-		KCPP_CUDA=12.1.0
+if [[ $KCPP_CUDA == "rocm" || $KCPP_CUDA == "nocuda" ]]; then
+	if [[ ! -f "conda/envs/linux/bin/python" || $1 == "rebuild" ]]; then
+		bin/micromamba create --no-rc --no-shortcuts -r conda -p conda/envs/linux -f environment-nocuda.yaml -y
+		bin/micromamba run -r conda -p conda/envs/linux make clean
+		echo "$KCPP_CUDA" > conda/envs/linux/cudaver
 	fi
-	bin/micromamba create --no-rc --no-shortcuts -r conda -p conda/envs/linux -f environment.tmp.yaml -y
-	bin/micromamba run -r conda -p conda/envs/linux make clean
-	echo $KCPP_CUDA > conda/envs/linux/cudaver
-	rm environment.tmp.yaml
-fi
-
-if [[ ! -f "conda/envs/linux/bin/python" && $KCPP_CUDA == "rocm" || $1 == "rebuild" && $KCPP_CUDA == "rocm" ]]; then
-	bin/micromamba create --no-rc --no-shortcuts -r conda -p conda/envs/linux -f environment-nocuda.yaml -y
-	bin/micromamba run -r conda -p conda/envs/linux make clean
-	echo "rocm" > conda/envs/linux/cudaver
+else
+	if [[ ! -f "conda/envs/linux/bin/python" || $1 == "rebuild" ]]; then
+		cp environment.yaml environment.tmp.yaml
+		if [ -n "$KCPP_CUDA" ]; then
+			sed -i -e "s/nvidia\/label\/cuda-12.1.0/nvidia\/label\/cuda-$KCPP_CUDA/g" environment.tmp.yaml
+		else
+			KCPP_CUDA=12.1.0
+		fi
+		bin/micromamba create --no-rc --no-shortcuts -r conda -p conda/envs/linux -f environment.tmp.yaml -y
+		bin/micromamba run -r conda -p conda/envs/linux make clean
+		echo $KCPP_CUDA > conda/envs/linux/cudaver
+		rm environment.tmp.yaml
+	fi
 fi
 
 KCPP_CUDA=$(<conda/envs/linux/cudaver)
@@ -47,6 +49,8 @@ fi
 
 if [ "$KCPP_CUDA" = "rocm" ]; then
 	bin/micromamba run -r conda -p conda/envs/linux make -j$(nproc) LLAMA_VULKAN=1 LLAMA_HIPBLAS=1 LLAMA_PORTABLE=1 LLAMA_USE_BUNDLED_GLSLC=1 LLAMA_ADD_CONDA_PATHS=1 $LLAMA_NOAVX1_FLAG $LLAMA_NOAVX2_FLAG $ARCHES_FLAG
+elif [ "$KCPP_CUDA" = "nocuda" ]; then
+	bin/micromamba run -r conda -p conda/envs/linux make -j$(nproc) LLAMA_VULKAN=1 LLAMA_PORTABLE=1 LLAMA_USE_BUNDLED_GLSLC=1 LLAMA_ADD_CONDA_PATHS=1 $LLAMA_NOAVX1_FLAG $LLAMA_NOAVX2_FLAG
 else
 	bin/micromamba run -r conda -p conda/envs/linux make -j$(nproc) LLAMA_VULKAN=1 LLAMA_CUBLAS=1 LLAMA_PORTABLE=1 LLAMA_USE_BUNDLED_GLSLC=1 LLAMA_ADD_CONDA_PATHS=1 $LLAMA_NOAVX1_FLAG $LLAMA_NOAVX2_FLAG $ARCHES_FLAG
 fi
@@ -74,6 +78,8 @@ elif [[ $1 == "dist" ]]; then
 		else
 			bin/micromamba run -r conda -p conda/envs/linux pyinstaller --noconfirm --onefile --collect-all customtkinter --collect-all jinja2 --collect-all psutil --add-data './dist/koboldcpp-launcher/koboldcpp-launcher:.' --add-data './koboldcpp_default.so:.' --add-data './koboldcpp_hipblas.so:.' --add-data './koboldcpp_vulkan.so:.' --add-data './koboldcpp_failsafe.so:.' --add-data './koboldcpp_noavx2.so:.' --add-data './koboldcpp_vulkan_noavx2.so:.' --add-data './kcpp_adapters:./kcpp_adapters' --add-data './koboldcpp.py:.' --add-data './json_to_gbnf.py:.' --add-data './LICENSE.md:.' --add-data './MIT_LICENSE_GGML_SDCPP_LLAMACPP_ONLY.md:.' --add-data './embd_res:./embd_res' --add-data "$ROCM_PATH/lib/rocblas:." --add-data "$ROCM_PATH/lib/libamd_comgr.so:." --version-file './version.txt' --clean --console koboldcpp.py -n "koboldcpp-linux-x64-rocm"
 		fi
+	elif [ "$KCPP_CUDA" = "nocuda" ]; then
+		bin/micromamba run -r conda -p conda/envs/linux pyinstaller --noconfirm --onefile --collect-all customtkinter --collect-all jinja2 --collect-all psutil --add-data './dist/koboldcpp-launcher/koboldcpp-launcher:.' --add-data './koboldcpp_default.so:.' --add-data './koboldcpp_vulkan.so:.' --add-data './koboldcpp_failsafe.so:.' --add-data './koboldcpp_noavx2.so:.' --add-data './koboldcpp_vulkan_noavx2.so:.' --add-data './kcpp_adapters:./kcpp_adapters' --add-data './koboldcpp.py:.' --add-data './json_to_gbnf.py:.' --add-data './LICENSE.md:.' --add-data './MIT_LICENSE_GGML_SDCPP_LLAMACPP_ONLY.md:.' --add-data './embd_res:./embd_res' --version-file './version.txt' --clean --console koboldcpp.py -n "koboldcpp-linux-x64-nocuda$KCPP_APPEND"
 	else
 		bin/micromamba run -r conda -p conda/envs/linux pyinstaller --noconfirm --onedir --collect-all customtkinter --collect-all jinja2 --collect-all psutil --add-data './koboldcpp.py:.' --add-data './json_to_gbnf.py:.' --version-file './version.txt' --clean --console koboldcpp.py -n "koboldcpp-launcher"
 		if [ -n "$NOAVX1" ]; then
