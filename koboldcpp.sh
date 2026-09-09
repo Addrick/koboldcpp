@@ -1,7 +1,10 @@
 #!/bin/bash
 
 if [ ! -f "bin/micromamba" ]; then
-	curl -Ls https://anaconda.org/conda-forge/micromamba/1.5.3/download/linux-64/micromamba-1.5.3-0.tar.bz2 | tar -xvj bin/micromamba
+	mkdir -p bin
+	curl -fLs https://github.com/mamba-org/micromamba-releases/releases/download/1.5.3-0/micromamba-linux-64 -o bin/micromamba || \
+	(curl -fLs https://anaconda.org/conda-forge/micromamba/1.5.3/download/linux-64/micromamba-1.5.3-0.tar.bz2 | tar -xvj bin/micromamba)
+	chmod +x bin/micromamba
 fi
 
 if [[ $KCPP_CUDA == "rocm" || $KCPP_CUDA == "nocuda" ]]; then
