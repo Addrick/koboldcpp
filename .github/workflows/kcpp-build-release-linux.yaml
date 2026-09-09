@@ -13,6 +13,14 @@ on:
   push:
     branches: [main, deploy]
 
+# ct100 is a single self-hosted runner. Without this, a rapid series of pushes
+# queues several full builds against one box; a cancelled run's `make` children
+# are not reliably reaped, so the next run piles on top of them. That overlap is
+# what preceded the runner dying in run 34303070790.
+concurrency:
+  group: kcpp-linux-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
   KCPP_CUDA: nocuda
@@ -22,6 +30,7 @@ jobs:
   linux:
     runs-on: [self-hosted, Linux, ct100]
     permissions: write-all
+    timeout-minutes: 90
     steps:
       - name: Clone
         id: checkout
@@ -33,6 +42,76 @@ jobs:
         run: |
           echo "Building from ref: ${{ inputs.commit_hash != '' && inputs.commit_hash || github.head_ref || github.ref_name }}"
 
+      # environment-nocuda.yaml supplies the compiler, make, ninja, tk and
+      # pyinstaller, so the host only has to provide what runs *before* the conda
+      # env exists -- plus gh, which the old ubuntu:20.04 job container installed
+      # for itself and nothing replaced when the container was dropped. Check it
+      # in seconds rather than discovering the gap 15 minutes into a compile.
+      - name: Preflight - host toolchain
+        run: |
+          set -euo pipefail
+          missing=""
+          for t in curl bzip2 gh; do
+            command -v "$t" >/dev/null 2>&1 || missing="$missing $t"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::ct100 is missing build prerequisites:$missing (install them on the runner host)"
+            exit 1
+          fi
+          echo "Toolchain OK."
+
+      # ct100 is a 16 GiB LXC that also runs every docker service on the network
+      # (derpr, hindsight, zammad prod+test, caddy, gatus, cloudflared). Those
+      # hold ~11 GiB at rest, so MemTotal is a fiction here -- only MemAvailable
+      # describes what a build may actually take. A wedged build volume also
+      # looks exactly like a wedged box from GitHub's side, so check that too.
+      - name: Preflight - capacity, and size the build
+        run: |
+          set -euo pipefail
+          free_gb=$(df -PBG . | awk 'NR==2 {gsub(/G/,"",$4); print $4}')
+          echo "Build volume free: ${free_gb} GiB"
+          if [ "$free_gb" -lt 20 ]; then
+            echo "::error::Only ${free_gb} GiB free; the conda env + objects + dist need ~20 GiB."
+            exit 1
+          fi
+
+          cores=$(nproc)
+          avail_gb=$(awk '/MemAvailable/ {printf "%d", $2/1048576}' /proc/meminfo)
+
+          # MemAvailable reflects the container only while lxcfs is mounted. If it
+          # exceeds the container's own cap, lxcfs is not masking /proc/meminfo
+          # and we are reading the whole host -- fall back to cgroup headroom
+          # then. Do not take the tighter of the two unconditionally: memory.current
+          # counts reclaimable page cache as used, so headroom understates what a
+          # build can actually have and would force a needlessly serial make.
+          for d in /sys/fs/cgroup /sys/fs/cgroup/memory; do
+            [ -r "$d/memory.max" ] && [ -r "$d/memory.current" ] || continue
+            lim=$(cat "$d/memory.max"); cur=$(cat "$d/memory.current")
+            case "$lim" in ''|max|*[!0-9]*) continue ;; esac
+            case "$cur" in ''|*[!0-9]*) continue ;; esac
+            lim_gb=$(( lim / 1073741824 ))
+            if [ "$avail_gb" -gt "$lim_gb" ]; then
+              avail_gb=$(( (lim - cur) / 1073741824 ))
+              echo "lxcfs is not masking /proc/meminfo; using cgroup headroom ${avail_gb} GiB"
+            fi
+            break
+          done
+
+          echo "Sizing against ${cores} cores / ${avail_gb} GiB available"
+          if [ "$avail_gb" -lt 3 ]; then
+            echo "::error::Only ${avail_gb} GiB available on ct100 -- refusing to build rather than thrash the host's other services."
+            exit 1
+          fi
+
+          # Leave a GiB for the co-tenant services, then budget ~2 GiB per
+          # concurrent ggml/llama.cpp translation unit.
+          jobs=$(( (avail_gb - 1) / 2 ))
+          [ "$jobs" -gt $(( cores / 2 )) ] && jobs=$(( cores / 2 ))
+          [ "$jobs" -gt 6 ] && jobs=6
+          [ "$jobs" -lt 1 ] && jobs=1
+          echo "BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
+          echo "Building with -j${jobs}"
+
       - name: Set Tcl/Tk Paths
         run: |
           echo "TCL_LIBRARY=$(find /usr/lib/ -name 'tcl8*' | head -n 1)" >> $GITHUB_ENV
@@ -41,7 +120,44 @@ jobs:
       - name: Build
         id: make_build
         run: |
-          ./koboldcpp.sh dist
+          set -euo pipefail
+          # koboldcpp.sh hardcodes a make -j$(nproc). Unbounded on ct100 that is
+          # 12 concurrent compiles against ~5 GiB of headroom: the container pins
+          # its memory.high ceiling and every process in it -- sshd, hindsight,
+          # the runner's own connection to GitHub -- starves in reclaim. Nothing
+          # is OOM-killed (run 34303070790 recorded 28M memory.high events and
+          # zero oom_kill); the box just stops answering.
+          #
+          # Shimming nproc caps -j without patching koboldcpp.sh, which is an
+          # upstream file we do not want to carry a fork-local diff in. nice and
+          # ionice keep the co-tenant services responsive while the build runs.
+          shim="$RUNNER_TEMP/ci-bin"
+          mkdir -p "$shim"
+          printf '#!/bin/sh\necho %s\n' "$BUILD_JOBS" > "$shim/nproc"
+          chmod +x "$shim/nproc"
+
+          prefix=""
+          command -v nice   >/dev/null 2>&1 && prefix="nice -n 15"
+          command -v ionice >/dev/null 2>&1 && prefix="$prefix ionice -c3"
+
+          # The timeout is the guard that matters. When the runner starved,
+          # GitHub failed the job at 11 minutes but nothing reaped the build:
+          # make and its compilers ran on for another 72 minutes, holding the box
+          # down long after the job was gone. A self-imposed deadline dies with
+          # or without the runner.
+          PATH="$shim:$PATH" timeout --signal=TERM --kill-after=60s 75m $prefix ./koboldcpp.sh dist
+
+      # Belt to the timeout's braces: if this job ends any other way -- cancelled,
+      # or force-failed by GitHub -- reap what the build left behind so the next
+      # run does not start on an already-loaded box.
+      - name: Reap stray build processes
+        if: always()
+        run: |
+          for p in cc1plus cc1 x86_64-conda-linux-gnu-cc1plus; do
+            pkill -9 -x "$p" 2>/dev/null || true
+          done
+          pkill -9 -f "micromamba run .* make" 2>/dev/null || true
+          exit 0
 
       - name: Rename file before upload
         run: |
@@ -59,6 +175,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           if [ -f dist/koboldcpp-linux-x64 ]; then
             gh release upload rolling dist/koboldcpp-linux-x64 --clobber --repo ${{ github.repository }}
           fi
@@ -70,6 +187,7 @@ jobs:
     needs: linux
     if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.commit_hash == '')
     runs-on: [self-hosted, Linux, ct101]
+    timeout-minutes: 20
     steps:
       - name: Fetch and stage rolling binary
         env:
@@ -92,4 +210,3 @@ jobs:
 
       - name: Report deployment status
         run: /opt/kcpp-ops/cutover.sh --status
-
