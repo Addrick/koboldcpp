@@ -6061,23 +6061,6 @@ static int smartcache_identical_slot_at_kv_depth()
     return -1;
 }
 
-#define LADDER_HEAD_WRITTEN 1
-#define LADDER_HEAD_COVERED 2
-static int smartcache_ladder_take_head()
-{
-    int existing = smartcache_identical_slot_at_kv_depth();
-    if(existing!=-1)
-    {
-        //Already on disk, byte for byte. Touching it is the whole write. When it is the head
-        //slot itself this is an unchanged retry against a head that is still current, which
-        //may still be promoted; when it is a rung, the ladder already has a point at this
-        //depth and there is nothing left to promote.
-        touch_slot(existing);
-        return (existing==rnn_reusable_slot_idx) ? LADDER_HEAD_WRITTEN : LADDER_HEAD_COVERED;
-    }
-    smartcache_quick_snapshot(rnn_reusable_slot_idx);
-    return LADDER_HEAD_WRITTEN;
-}
 
 generation_outputs gpttype_generate(const generation_inputs inputs)
 {
@@ -7056,25 +7039,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         printf("%s\n\n", RemoveBell(outstr).c_str());
     }
 
-    //The depth this turn will END at, known BEFORE ingestion starts. That is what makes
-    //seeding possible: the ladder gap is a function of the head depth, and the head depth is
-    //n_past plus the prompt that is about to be consumed.
-    const int ladder_head_depth = n_past + (int)embd_inp.size();
-    //Where the last seed landed. Starts at the pre-existing depth so the FIRST seed is a
-    //full gap in, not at the first batch boundary: smartcache_ladder_worth_writing answers
-    //"yes" when there is no fallback at all, which on a cold prefill is true at 1024 tokens.
-    //The guard spaces a candidate against existing RUNGS; this spaces the candidates.
-    int ladder_last_seed = n_past;
-    //Did THIS TURN write the head checkpoint? Nothing downstream could ask before: promotion
-    //tested only that the head slot was non-empty, so a state left there by an earlier turn
-    //could be pinned as a durable rung while rnn_reusable_slot_idx moved on to an empty slot -
-    //leaving no head checkpoint at all, and after an edit pinning a state that is already dead.
-    bool ladder_head_written = false;
-    //...or already held by a durable rung, which a retry re-derives exactly. Kept apart from
-    //`written` because only a write may be promoted: a dedup means the ladder already has a
-    //point at this depth, so there is nothing to pin and nothing to warn about.
-    bool ladder_head_covered = false;
-
     while (remaining_tokens > 0 && !early_abort)
     {
         gpt_vocab::id id = 0;
@@ -7122,36 +7086,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     int32_t decode_status = -1;
                     bool skipdecodelater = false;
 
-                    //Snapshot 32 tokens before the prefill ends. In ladder mode this IS the head
-                    //checkpoint - one snapshot doing the job the head slot and the separate
-                    //prompt_end-32 boundary rung used to split between them, for half the bytes.
-                    //GATE ON DEPTH, NOT ON THIS TURN'S NEW TOKENS. embd_inp is POST-fast-forward -
-                    //model_adapter.cpp erases the reused prefix off the front of it - so
-                    //input_consumed>64 asks how much text this turn ADDED, and an ordinary short
-                    //follow-up after 40k of chat adds twenty. In ladder mode that skipped the head
-                    //write; promotion then had nothing to promote and the ladder stopped growing
-                    //for as long as the turns stayed short. tests/test_head_write_gate.py.
-                    //The non-ladder boundary rung keeps the token test: it hedges a PROMPT, not a
-                    //conversation, so "how much arrived" is the right question there.
-                    const bool ladder_head_due = rnn_ladder_enabled && ladder_head_depth > 64;
-                    if(draft_ctx==nullptr && !startedsampling && input_consumed==embd_inp.size()
-                       && (ladder_head_due || (embd.size()>1 && input_consumed>64)))
+                    //Snapshot 32 tokens before the prefill ends (legacy non-grid mode only).
+                    if(!smartcache_grid_mode && draft_ctx==nullptr && !startedsampling && input_consumed==embd_inp.size()
+                       && embd.size()>1 && input_consumed>64)
                     {
                         if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
                         {
                             if(embd.size()<=48)
                             {
-                                //directly snapshot for a small batch
-                                if(smartcache_grid_mode)
-                                {
-                                    int taken = smartcache_ladder_take_head();
-                                    ladder_head_written = (taken==LADDER_HEAD_WRITTEN);
-                                    ladder_head_covered = (taken==LADDER_HEAD_COVERED);
-                                }
-                                else
-                                {
-                                    smartcache_quick_snapshot(rnn_boundary_slot_idx);
-                                }
+                                smartcache_quick_snapshot(rnn_boundary_slot_idx);
                             }
                             else
                             {
@@ -7164,16 +7107,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 {
                                     if(p==parts.size()-1)
                                     {
-                                        if(smartcache_grid_mode)
-                                        {
-                                            int taken = smartcache_ladder_take_head();
-                                            ladder_head_written = (taken==LADDER_HEAD_WRITTEN);
-                                            ladder_head_covered = (taken==LADDER_HEAD_COVERED);
-                                        }
-                                        else
-                                        {
-                                            smartcache_quick_snapshot(rnn_boundary_slot_idx);
-                                        }
+                                        smartcache_quick_snapshot(rnn_boundary_slot_idx);
                                     }
                                     std::vector<gpt_vocab::id> chunk = parts[p];
                                     kcpp_embd_batch smallbatch = kcpp_embd_batch(chunk, temp_past, use_mrope, draft_is_mtp);
@@ -7342,41 +7276,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                        llama_state_get_size(llama_ctx_v4));
         }
 
-        if(rnn_ladder_enabled && !startedsampling && input_consumed < (int)embd_inp.size())
-        {
-            const int seeddepth = (int)current_context_tokens.size();
-            const int seedgap = smartcache_ladder_gap(ladder_head_depth);
-            //Three conditions: a full gap since the last seed, HALF a gap of headroom below
-            //the head, and the ordinary write guard.
-            //
-            //Half a gap, not a full one, and that is not a fudge. A candidate only exists
-            //where this loop actually is - on a batch boundary. On the very first cold
-            //arrival the cost model has not seen two distinct depths yet, so capacity falls
-            //back to 1 and the gap becomes head/2; requiring a full gap on BOTH sides then
-            //intersects in exactly one token position (15042 of 30084), which a 1024-token
-            //batch steps straight over. Measured on omen 2026-09-03: nothing seeded at all.
-            //The head checkpoint covers the top anyway, and the promotion guard still
-            //refuses to make a rung of anything too close to it.
-            if(seeddepth - ladder_last_seed >= seedgap
-               && ladder_head_depth - seeddepth >= seedgap/2
-               && smartcache_ladder_worth_writing(seeddepth, ladder_head_depth))
-            {
-                //A free slot, or a dead one reclaimed. Never a live rung: taking an occupied one
-                //would clobber live history to store a shallower point, and byte pressure is
-                //gpttype_save_state_kv's job. Seeding starves on the POOL exactly the way
-                //promotion did, so it uses the same acquire - the pool-starvation fix landing on
-                //only one of the two paths left a cold arrival into a pool of dead rungs seeding
-                //nothing at all.
-                int seedslot = smartcache_acquire_rung_slot("a prefill seed");
-                if(seedslot!=-1 && savestates[seedslot].current_savestate_buffer.empty())
-                {
-                    gpttype_save_state_kv(seedslot);
-                    ladder_last_seed = seeddepth;
-                    printf("\n[SmartCache Ladder: seeded slot %d @ depth %d during prefill (gap %d, head %d)]\n",
-                           seedslot, seeddepth, seedgap, ladder_head_depth);
-                }
-            }
-        }
 
         if(rnn_lifeboat_enabled && !rnn_lifeboat_taken && !startedsampling && n_past >= rnn_lifeboat_target && input_consumed < (int)embd_inp.size())
         {
@@ -7425,88 +7324,6 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     printf("\n");
                 }
 
-                 //if running rnn model in smartcache mode, save progress before each gen
-                if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
-                {
-                    if(rnn_ladder_enabled)
-                    {
-                        //THE ONLY LADDER DECISION, once per turn, after the prompt is fully
-                        //ingested. It takes NO snapshot: this turn's head checkpoint was already
-                        //written 32 tokens back, and if it has earned rung status the cheapest
-                        //possible way to keep it is to stop overwriting it. Taking a second
-                        //snapshot here instead would put two full-depth states 32 tokens apart,
-                        //which is the defect this whole change exists to remove.
-                        //THE BACKSTOP. The write above is placed 32 tokens before the end of the
-                        //prefill, which needs a decode to hook onto - and a turn whose prompt is
-                        //entirely cached decodes nothing at all. The recurrent path fast-forwards
-                        //with minimum_input_to_keep=0, so embd_inp really can come out empty; the
-                        //"reloading from a perfectly matched state" logits fallback further down
-                        //exists for exactly that turn. There is no "32 tokens back" moment on it,
-                        //so take the head at full depth here instead. quick_snapshot on the NAMED
-                        //slot dedups against itself, so an unchanged retry costs a touch rather
-                        //than a full-depth serialize.
-                        if(!ladder_head_written && !ladder_head_covered
-                           && draft_ctx==nullptr && rnn_reusable_slot_idx!=-1)
-                        {
-                            smartcache_quick_snapshot(rnn_reusable_slot_idx);
-                            ladder_head_written = true;
-                            printf("\n[SmartCache Ladder: head checkpoint taken at full depth %zu (nothing decoded this turn)]\n",
-                                   current_context_tokens.size());
-                        }
-                        const int depth = (int)current_context_tokens.size();
-                        const int headslot = rnn_reusable_slot_idx;
-                        const int headdepth = (headslot>=0 && !savestates[headslot].current_savestate_buffer.empty())
-                            ? (int)savestates[headslot].savestate_context_tokens.size() : 0;
-                        //nearest_below skips the head slot, so this is the distance to the nearest
-                        //DURABLE rung - the head checkpoint cannot vouch for itself.
-                        const int nearest = (headdepth>0 ? smartcache_ladder_nearest_below(headdepth) : 0);
-                        //REFUSE A HEAD THIS TURN DID NOT WRITE. worth_writing cannot cover this:
-                        //nearest_below and nearest_above both skip the head slot by construction,
-                        //so it structurally cannot liveness-test the head. What is left is a
-                        //draft/speculative model, where the write above is skipped because the
-                        //snapshot does not carry the draft context - the ladder is then built by
-                        //seeding alone, rather than by pinning whatever the head slot still holds.
-                        if(headdepth>0 && !ladder_head_written)
-                        {
-                            //A COVERED head is not a stale one: some rung already holds this
-                            //turn's head point, so there is nothing to pin and nothing to warn
-                            //about. Only an absent write is worth a line.
-                            if(!ladder_head_covered)
-                            {
-                                printf("\n[SmartCache Ladder: head slot %d @ depth %d was not written this turn; not promoting a stale head]\n",
-                                       headslot, headdepth);
-                            }
-                        }
-                        else if(headdepth>0 && smartcache_ladder_worth_writing(headdepth, depth))
-                        {
-                            //Only promote into a genuinely free slot. Taking an occupied one would
-                            //clobber a rung on the next head write, trading a deep point for a
-                            //head-adjacent one - the wrong direction. Eviction frees slots, so
-                            //this is a pause, not a ceiling.
-                            int fresh = smartcache_acquire_rung_slot("a promotion");
-                            if(fresh!=-1 && savestates[fresh].current_savestate_buffer.empty())
-                            {
-                                rnn_reusable_slot_idx = fresh;
-                                printf("\n[SmartCache Ladder: promoted slot %d @ depth %d to a durable rung (gap %d, nearest rung %d back); head moves to slot %d]\n",
-                                       headslot, headdepth, smartcache_ladder_gap(depth), nearest, fresh);
-                            }
-                            else
-                            {
-                                printf("\n[SmartCache Ladder: slot %d @ depth %d earned promotion but no free slot; ladder holds]\n",
-                                       headslot, headdepth);
-                            }
-                        }
-                        smartcache_ladder_inventory("after turn");
-                    }
-                    else if(rnn_reusable_slot_idx!=-1)
-                    {
-                        smartcache_quick_snapshot(rnn_reusable_slot_idx);
-                    }
-                    else
-                    {
-                        smartcache_quick_snapshot();
-                    }
-                }
             }
 
             const std::vector<llama_token> eog_tokens = GetEogIDs(file_format,n_vocab);
@@ -8085,11 +7902,58 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         delayed_generated_tokens.pop_front();
     }
 
-    //if running rnn model in smartcache mode, save progress after each gen
-    // if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
-    // {
-    //     smartcache_quick_snapshot();
-    // }
+    // THE ONLY WRITE: writes only take place after a generation finishes, and only once.
+    if(!early_abort && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
+    {
+        if(rnn_ladder_enabled)
+        {
+            int identical_slot = smartcache_identical_slot_at_kv_depth();
+            if(identical_slot != -1)
+            {
+                touch_slot(identical_slot);
+            }
+            else
+            {
+                const int depth = (int)current_context_tokens.size();
+                const int headslot = rnn_reusable_slot_idx;
+                const int headdepth = (headslot >= 0 && !savestates[headslot].current_savestate_buffer.empty())
+                    ? (int)savestates[headslot].savestate_context_tokens.size() : 0;
+                const int nearest = (headdepth > 0 ? smartcache_ladder_nearest_below(headdepth) : 0);
+
+                if(headdepth > 0 && headdepth < depth && smartcache_ladder_rung_live(headslot) && smartcache_ladder_worth_writing(headdepth, depth))
+                {
+                    int fresh = smartcache_acquire_rung_slot("a promotion");
+                    if(fresh != -1 && savestates[fresh].current_savestate_buffer.empty())
+                    {
+                        rnn_reusable_slot_idx = fresh;
+                        printf("\n[SmartCache Ladder: promoted slot %d @ depth %d to a durable rung (gap %d, nearest rung %d back); head moves to slot %d]\n",
+                               headslot, headdepth, smartcache_ladder_gap(depth), nearest, fresh);
+                    }
+                    else
+                    {
+                        printf("\n[SmartCache Ladder: slot %d @ depth %d earned promotion but no free slot; ladder holds]\n",
+                               headslot, headdepth);
+                    }
+                }
+                else if(headdepth > 0 && !smartcache_ladder_rung_live(headslot))
+                {
+                    printf("\n[SmartCache Ladder: head slot %d @ depth %d is dead relative to current context; overwriting rather than promoting]\n",
+                           headslot, headdepth);
+                }
+
+                gpttype_save_state_kv(rnn_reusable_slot_idx);
+                smartcache_ladder_inventory("after turn");
+            }
+        }
+        else if(rnn_reusable_slot_idx != -1)
+        {
+            smartcache_quick_snapshot(rnn_reusable_slot_idx);
+        }
+        else
+        {
+            smartcache_quick_snapshot();
+        }
+    }
 
     if(debugmode==1 && !is_quiet && file_format == FileFormat::GGUF_GENERIC)
     {
