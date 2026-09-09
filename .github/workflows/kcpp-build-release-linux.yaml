@@ -20,7 +20,7 @@ env:
 
 jobs:
   linux:
-    runs-on: ubuntu-22.04
+    runs-on: [self-hosted, Linux, ct100]
     permissions: write-all
     container:
       image: ubuntu:20.04
