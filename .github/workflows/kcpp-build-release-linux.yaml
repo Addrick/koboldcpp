@@ -103,11 +103,20 @@ jobs:
             exit 1
           fi
 
-          # Leave a GiB for the co-tenant services, then budget ~2 GiB per
-          # concurrent ggml/llama.cpp translation unit.
-          jobs=$(( (avail_gb - 1) / 2 ))
-          [ "$jobs" -gt $(( cores / 2 )) ] && jobs=$(( cores / 2 ))
-          [ "$jobs" -gt 6 ] && jobs=6
+          # Leave a GiB for the co-tenant services, then budget per concurrent
+          # translation unit. 640 MiB is measured headroom over this target, not
+          # a guess: cc1plus peaks at ~282 MiB building nocuda/Vulkan (most TUs
+          # are well under 150 MiB). The 2 GiB figure that belongs to
+          # CUDA-template TUs sized this to -j2 on a 12-core box, which is
+          # slower than the GitHub-hosted runner this moved off.
+          jobs=$(( (avail_gb - 1) * 1024 / 640 ))
+
+          # Leave two cores for the docker services. Past that let memory bind:
+          # nice/ionice keep the co-tenants responsive, and CPU contention only
+          # ever costs latency, where overcommitting RAM wedges the whole box.
+          max_jobs=$(( cores - 2 ))
+          [ "$max_jobs" -lt 1 ] && max_jobs=1
+          [ "$jobs" -gt "$max_jobs" ] && jobs=$max_jobs
           [ "$jobs" -lt 1 ] && jobs=1
           echo "BUILD_JOBS=$jobs" >> "$GITHUB_ENV"
           echo "Building with -j${jobs}"
@@ -145,7 +154,11 @@ jobs:
           # make and its compilers ran on for another 72 minutes, holding the box
           # down long after the job was gone. A self-imposed deadline dies with
           # or without the runner.
-          PATH="$shim:$PATH" timeout --signal=TERM --kill-after=60s 75m $prefix ./koboldcpp.sh dist
+          #
+          # 30m is a backstop, not a target. A properly parallel build here is
+          # minutes; if this ever fires, the build is not slow, something is
+          # wrong -- most likely the sizing collapsed to -j1 again.
+          PATH="$shim:$PATH" timeout --signal=TERM --kill-after=60s 30m $prefix ./koboldcpp.sh dist
 
       # Belt to the timeout's braces: if this job ends any other way -- cancelled,
       # or force-failed by GitHub -- reap what the build left behind so the next
