@@ -8,10 +8,10 @@ on:
         required: false
         default: ''
 
-  # fork-only (DP-326): build the deploy branch on push. Must never be
-  # carried onto feat/* or into an upstream PR.
+  # fork-only (DP-326): build and deploy on push to main or deploy.
+  # Must never be carried onto feat/* or into an upstream PR.
   push:
-    branches: [deploy]
+    branches: [main, deploy]
 
 env:
   BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
@@ -84,3 +84,33 @@ jobs:
         run: |
           gh release upload rolling dist/koboldcpp-linux-x64 --clobber --repo ${{ github.repository }}
           gh release upload rolling dist/koboldcpp-linux-x64-nocuda --clobber --repo ${{ github.repository }}
+
+  # JOB 2: Deploy to CT101 (:5001) via self-hosted runner
+  # Runs on push to main/deploy, or manual workflow_dispatch.
+  deploy:
+    needs: linux
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.commit_hash == '')
+    runs-on: [self-hosted, Linux, ct101]
+    steps:
+      - name: Fetch and stage rolling binary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: /opt/kcpp-ops/fetch-rolling.py --force
+
+      - name: Cut over and bounce :5001
+        run: /opt/kcpp-ops/cutover.sh --apply staged
+
+      - name: Verify driver VRAM residency
+        run: |
+          vram=$(cat /sys/class/drm/card1/device/mem_info_vram_used)
+          gtt=$(cat /sys/class/drm/card1/device/mem_info_gtt_used)
+          echo "Driver VRAM: $((vram / 1048576)) MiB, GTT: $((gtt / 1048576)) MiB"
+          if [ "$gtt" -gt 4294967296 ]; then
+            echo "ERROR: High GTT usage detected ($((gtt / 1048576)) MiB > 4096 MiB) — rolling back!" >&2
+            /opt/kcpp-ops/cutover.sh --rollback
+            exit 1
+          fi
+
+      - name: Report deployment status
+        run: /opt/kcpp-ops/cutover.sh --status
+
