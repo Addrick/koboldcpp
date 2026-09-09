@@ -22,9 +22,6 @@ jobs:
   linux:
     runs-on: [self-hosted, Linux, ct100]
     permissions: write-all
-    container:
-      image: kcpp-build:20.04
-      options: --privileged
     steps:
       - name: Clone
         id: checkout
