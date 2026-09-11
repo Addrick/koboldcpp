@@ -180,6 +180,12 @@ static int rnn_boundary_slot_idx = -1; //grid mode: reserved slot for the prompt
 static bool rnn_lifeboat_hard_reserved = false;
 static bool smartcache_grid_mode = false; //the grid owns the slot array; no swap slots, no lifeboat
 static int smartcache_protected_slot = -1; //a slot the byte budget must not evict - a load is about to read it
+//Prefill seeding's frame of reference for "dead". During a prefill current_context_tokens IS the
+//arriving prompt, so on its own it calls every rung of a swapped-away conversation dead. These
+//two let eviction ask the question against the context the turn arrived over as well.
+static std::vector<gpt_vocab::id> smartcache_pre_turn_tokens; //the cache's context when this turn arrived
+static std::vector<gpt_vocab::id> smartcache_arriving_tokens; //the whole prompt this turn is ingesting
+static bool smartcache_seed_write_in_flight = false; //get_evictable_slot may take true garbage only
 static std::string overridden_jinja_template = ""; //if set, overrides jinja template
 
 static int delayed_generated_tokens_limit = 0;
@@ -198,14 +204,18 @@ static size_t total_savestate_bytes = 0;
 static size_t smartcache_budget_bytes = 0;
 
 //OPPORTUNISTIC CHECKPOINT LADDER. One rule governs every ladder write: take a checkpoint only
-//if there is no fallback within N tokens of where we already are. Snapshots happen after a
-//turn completes, at whatever depth the KV is already sitting at - never scheduled mid-prefill,
-//never at a computed absolute depth. The ladder deepens as the conversation does.
+//if there is no fallback within N tokens of where we already are. Snapshots happen at whatever
+//depth the KV is already sitting at - never at a computed absolute depth. The ladder deepens as
+//the conversation does: normally one head write per turn, at prefill success. The one exception
+//is a DEEP ARRIVAL (a turn ingesting at least two gaps), which is seeded during its prefill -
+//see the seeding block in gpttype_generate - because otherwise it gets exactly one rung.
 //
-//Nothing else ever deletes a checkpoint. There is no retention sweep, nothing about the
-//incoming prompt influences what is kept, and an aborted turn leaves the ladder untouched
-//because no ladder code runs before a prefill any more. Space is reclaimed only to fund a
-//write, one victim at a time, shallowest first (get_evictable_slot).
+//Nothing else ever deletes a checkpoint. There is no retention sweep, and nothing about the
+//incoming prompt influences what is kept. Space is reclaimed only under memory pressure, to fund
+//a write, one victim at a time (get_evictable_slot) - with ONE known exception, the dead-slot
+//reclaim in smartcache_acquire_rung_slot, which fires on slot-pool pressure while the byte budget
+//may be slack. It is flagged there. A seed that an abort leaves behind is KEPT:
+//it is a genuine prefix of text the client sent, and a resend reuses it.
 //
 //N is DYNAMIC, and that is the part that makes the shape work. Held flat, oldest-first
 //eviction walks the whole ladder forward with the head and abandons deep history; grown with
@@ -5727,6 +5737,18 @@ static bool smartcache_ladder_rung_live(int i)
     return smartcache_prefix_compatible(savestates[i].savestate_context_tokens,current_context_tokens);
 }
 
+//DOES THIS TURN STILL NEED IT? Live against the context the cache held when the turn arrived, or
+//against the whole prompt being ingested. Mid-prefill, smartcache_ladder_rung_live asks only the
+//second question, and only of the part ingested so far - so a swapped-away conversation reads as
+//dead, and a prefill that may yet abort could spend it. A slot that fails BOTH is true garbage.
+//An empty reference owns nothing (prefix_compatible would call everything compatible with it).
+static bool smartcache_rung_owned_this_turn(int i)
+{
+    const std::vector<gpt_vocab::id> &t = savestates[i].savestate_context_tokens;
+    return (!smartcache_pre_turn_tokens.empty() && smartcache_prefix_compatible(t,smartcache_pre_turn_tokens))
+        || (!smartcache_arriving_tokens.empty() && smartcache_prefix_compatible(t,smartcache_arriving_tokens));
+}
+
 //Distance from `depth` back to the nearest checkpoint at or below it. INT32_MAX when there is
 //no fallback at all - which is exactly when a write is most worth taking.
 //
@@ -5915,15 +5937,11 @@ static bool smartcache_ladder_worth_writing(int depth, int head_depth)
 //A DEAD VICTIM ONLY. Trading a live rung for a new one is not obviously a win, and genuine byte
 //pressure is already the budget loop's job.
 //
-//Both the after-turn promotion and the mid-prefill seed call this, because both starve the same
-//way. Note what that means for a seed: liveness is judged against a context that is still
-//arriving, so a rung belonging to a conversation we have swapped away from reads as dead and can
-//be reclaimed by a prefill that may yet abort. That is the same class of action the budget loop
-//inside gpttype_save_state_kv already takes on a seed write - it too picks dead-first victims
-//while the prompt is still ingesting - so this widens WHEN it happens, not WHAT can happen.
-//Bounding it properly means making seeds provisional until the turn completes; that is a
-//separate change, and until it lands the "an aborted turn leaves the ladder untouched" claim in
-//this file's header comment is aspirational rather than true.
+//⚠️ EXCEPTION TO "EVICTION IS MEMORY-PRESSURE DRIVEN ONLY". This frees a slot because the POOL
+//is full, not because the byte budget is - at CT101 scale (savestate_limit = n_ctx/4096 + 1, 33
+//slots at 131k) the pool rarely binds, but where it does this deletes a checkpoint the budget had
+//room for. Left in place pending a decision; do not copy the pattern. Prefill seeding does NOT
+//call this: a seed takes a genuinely free slot or is skipped (smartcache_seed_slot).
 static int smartcache_acquire_rung_slot(const char *why)
 {
     int victim = get_evictable_slot(rnn_reusable_slot_idx,-1);
@@ -5940,6 +5958,71 @@ static int smartcache_acquire_rung_slot(const char *why)
         return fresh;
     }
     return -1;
+}
+
+//MAY A PREFILL SEED BE WRITTEN NOW, AND WHERE? The slot, or -1 with `why` filled in.
+//
+//A seed is speculative, so it is written only out of SLACK - it never competes with anything a
+//conversation can still resume from:
+//  - a genuinely free slot, and a second one left over for this turn's promotion. Never a
+//    reclaimed one: taking a slot off a full pool is not memory pressure.
+//  - bytes: everything held, minus the head slot (rewritten in place at prefill success), plus
+//    this seed at its exact size, plus the head's own coming write, must fit the budget once
+//    TRUE GARBAGE is freed - slots dead against both the pre-turn context and the arriving
+//    prompt. Those are the only victims get_evictable_slot offers while a seed is in flight, so
+//    passing here means the budget loop cannot be pushed into "over budget and nothing
+//    evictable", nor reach a rung anyone still owns.
+static int smartcache_seed_slot(int head_depth, size_t seed_bytes, std::string &why)
+{
+    int freeslot = -1;
+    int freecount = 0;
+    size_t garbage = 0;
+    for(int i=0;i<savestate_limit;++i)
+    {
+        if(i==rnn_reusable_slot_idx || i==rnn_boundary_slot_idx
+           || (rnn_lifeboat_hard_reserved && i==rnn_lifeboat_slot_idx))
+        {
+            continue;
+        }
+        if(savestates[i].current_savestate_buffer.empty())
+        {
+            if(freeslot==-1)
+            {
+                freeslot = i;
+            }
+            ++freecount;
+            continue;
+        }
+        if(i!=smartcache_protected_slot && !smartcache_ladder_rung_live(i) && !smartcache_rung_owned_this_turn(i))
+        {
+            garbage += savestates[i].current_savestate_size + savestates[i].current_draft_savestate_size;
+        }
+    }
+    if(freecount < 2)
+    {
+        why = std::to_string(freecount) + " free slot(s); a seed needs one and leaves one for the promotion";
+        return -1;
+    }
+    if(smartcache_budget_bytes > 0)
+    {
+        size_t headheld = 0;
+        if(rnn_reusable_slot_idx >= 0)
+        {
+            headheld = savestates[rnn_reusable_slot_idx].current_savestate_size + savestates[rnn_reusable_slot_idx].current_draft_savestate_size;
+        }
+        const double need = (double)total_savestate_bytes - (double)headheld - (double)garbage
+                          + (double)seed_bytes + smartcache_estimated_cost(head_depth);
+        if(need > (double)smartcache_budget_bytes)
+        {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%zu MB held (%zu MB garbage) + %zu MB seed + %.0f MB head exceeds the %zu MB budget",
+                     total_savestate_bytes/(1024*1024), garbage/(1024*1024), seed_bytes/(1024*1024),
+                     smartcache_estimated_cost(head_depth)/(1024.0*1024.0), smartcache_budget_bytes/(1024*1024));
+            why = buf;
+            return -1;
+        }
+    }
+    return freeslot;
 }
 
 //=============================================================================================
@@ -6146,6 +6229,11 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     dry_max_token_repeat.clear();
     top_picks_history.clear();
     early_abort = false;
+    if(smartcache_grid_mode)
+    {
+        smartcache_pre_turn_tokens = current_context_tokens; //before any swap-load or fast-forward touches it
+        smartcache_arriving_tokens.clear();
+    }
 
     double init_time = 0, process_time = 0, gen_time = 0;
     timer_start();
@@ -7083,6 +7171,18 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         printf("%s\n\n", RemoveBell(outstr).c_str());
     }
 
+    //Seeding state. The head depth this turn will END at is known before ingestion - n_past plus
+    //the post-fast-forward remainder - which is what makes the gap computable up front.
+    const int ladder_head_depth = n_past + (int)embd_inp.size();
+    const int ladder_ingest = (int)embd_inp.size(); //what this turn actually prefills
+    //Starts at the reused depth so the first seed is a full gap in, not at the first batch.
+    int ladder_last_seed = n_past;
+    if(rnn_ladder_enabled)
+    {
+        smartcache_arriving_tokens = current_context_tokens;
+        smartcache_arriving_tokens.insert(smartcache_arriving_tokens.end(), embd_inp.begin(), embd_inp.end());
+    }
+
     while (remaining_tokens > 0 && !early_abort)
     {
         gpt_vocab::id id = 0;
@@ -7318,6 +7418,51 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         {
             smartcache_note_state_cost((int)current_context_tokens.size(),
                                        llama_state_get_size(llama_ctx_v4));
+        }
+
+        //SEEDING A DEEP ARRIVAL (DP-326). Rung depths are otherwise a subset of turn boundaries,
+        //so a conversation that arrives deep in ONE turn gets exactly one checkpoint - the head,
+        //at the tip, dead the moment the tail changes (CT101 2026-09-10: 59,938 tokens, every
+        //new question full-reprocessed while 2141 of 32768 MB was held).
+        //
+        //Scoped so that a30892c4d's properties survive for everything else:
+        //  - ARMED BY PROMPT SIZE: only a turn that ingests at least two gaps seeds. An append,
+        //    a retry or a small edit never arms, and keeps its one write per turn.
+        //  - PLACEMENT as 00489951d: a full gap since the last seed, half a gap of headroom below
+        //    the head (the head checkpoint covers the top), then the ordinary write guard.
+        //  - SLACK ONLY (smartcache_seed_slot): a free slot, and bytes that fit once true garbage
+        //    is freed. While the write is in flight get_evictable_slot offers nothing else, so a
+        //    seed never costs a rung the pre-turn conversation or this prompt still owns.
+        //  - KEPT ON ABORT: a seed is a real prefix of what the client sent; a resend reuses it.
+        //Candidates exist only on batch boundaries, so seeds land within a batch of the target.
+        if(rnn_ladder_enabled && !startedsampling && input_consumed < (int)embd_inp.size())
+        {
+            const int seeddepth = (int)current_context_tokens.size();
+            const int seedgap = smartcache_ladder_gap(ladder_head_depth);
+            if(ladder_ingest >= 2*seedgap
+               && seeddepth - ladder_last_seed >= seedgap
+               && ladder_head_depth - seeddepth >= seedgap/2
+               && smartcache_ladder_worth_writing(seeddepth, ladder_head_depth))
+            {
+                ladder_last_seed = seeddepth; //a skip is also final for this gap - one line per candidate, not per batch
+                std::string why;
+                //exact, draft included: gpttype_save_state_kv writes both, and an underestimate here
+                //would leave its budget loop looking for victims the seed may not take
+                const size_t seedbytes = llama_state_get_size(llama_ctx_v4) + (draft_ctx ? llama_state_get_size(draft_ctx) : 0);
+                int seedslot = smartcache_seed_slot(ladder_head_depth, seedbytes, why);
+                if(seedslot!=-1)
+                {
+                    smartcache_seed_write_in_flight = true;
+                    gpttype_save_state_kv(seedslot);
+                    smartcache_seed_write_in_flight = false;
+                    printf("\n[SmartCache Ladder: seeded slot %d @ depth %d during prefill (gap %d, head %d)]\n",
+                           seedslot, seeddepth, seedgap, ladder_head_depth);
+                }
+                else
+                {
+                    printf("\n[SmartCache Ladder: seed @ depth %d skipped - %s]\n", seeddepth, why.c_str());
+                }
+            }
         }
 
 
@@ -8363,13 +8508,29 @@ int get_evictable_slot(int excludeSlotA, int excludeSlotB)
         //after that full-reprocessed. Deepest-first frees the same bytes in one eviction and
         //keeps all three. With the budget not binding the two rules pick the same slots, so
         //this only changes behaviour under pressure.
+        //
+        //THREE CLASSES, not two. "Dead" against current_context_tokens is judged mid-prefill
+        //against a context still arriving, so a swapped-away conversation reads dead. Rungs this
+        //turn still owns (smartcache_rung_owned_this_turn) sort between true garbage and live,
+        //and a prefill seed may take true garbage ONLY - it is a speculative write and must not
+        //be funded by history some conversation can still resume from.
         int64_t rank = savestates[i].last_used;
         if(smartcache_grid_mode)
         {
-            rank = -(int64_t)savestates[i].savestate_context_tokens.size();
-            if(smartcache_ladder_rung_live(i))
+            const bool live = smartcache_ladder_rung_live(i);
+            const bool owned = smartcache_rung_owned_this_turn(i);
+            if(smartcache_seed_write_in_flight && (live || owned))
             {
-                rank += SMARTCACHE_LIVE_RANK_BIAS; //every live rung sorts behind every dead one
+                continue;
+            }
+            rank = -(int64_t)savestates[i].savestate_context_tokens.size();
+            if(live)
+            {
+                rank += 2*SMARTCACHE_LIVE_RANK_BIAS; //every live rung sorts behind every dead one
+            }
+            else if(owned)
+            {
+                rank += SMARTCACHE_LIVE_RANK_BIAS; //...and behind true garbage, ahead of live
             }
         }
         if(rank < slotage || slotid==-1)
