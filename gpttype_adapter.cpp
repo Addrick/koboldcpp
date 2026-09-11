@@ -212,9 +212,8 @@ static size_t smartcache_budget_bytes = 0;
 //
 //Nothing else ever deletes a checkpoint. There is no retention sweep, and nothing about the
 //incoming prompt influences what is kept. Space is reclaimed only under memory pressure, to fund
-//a write, one victim at a time (get_evictable_slot) - with ONE known exception, the dead-slot
-//reclaim in smartcache_acquire_rung_slot, which fires on slot-pool pressure while the byte budget
-//may be slack. It is flagged there. A seed that an abort leaves behind is KEPT:
+//a write, one victim at a time (get_evictable_slot). There is no slot pool to run out of - see
+//smartcache_free_slot. A seed that an abort leaves behind is KEPT:
 //it is a genuine prefix of text the client sent, and a resend reuses it.
 //
 //N is DYNAMIC, and that is the part that makes the shape work. Held flat, oldest-first
@@ -3678,7 +3677,7 @@ ModelLoadResult gpttype_load_model(const load_model_inputs inputs, FileFormat in
                        smartcache_budget_bytes/(1024*1024));
                 printf("            only when no fallback exists within N tokens. N grows with depth, so the\n");
                 printf("            ladder spreads instead of stacking at the head. Nothing else deletes one.\n");
-                printf("SmartCache: %d ladder slots (a ceiling) + 1 head checkpoint. No swap slots, no lifeboat, no rung.\n",savestate_limit-1);
+                printf("SmartCache: %d ladder slots + 1 head checkpoint to start; the slot array grows on demand, bytes are the only bound. No swap slots, no lifeboat, no rung.\n",savestate_limit-1);
             }
             else if(smartcache_budget_bytes>0)
             {
@@ -5923,60 +5922,19 @@ static bool smartcache_ladder_worth_writing(int depth, int head_depth)
         && smartcache_ladder_nearest_above(depth) >= g;
 }
 
-//WHERE DOES A NEW RUNG GO? A genuinely free slot, or a dead one reclaimed on the spot. -1 when
-//the ladder must hold - which is a pause, not a ceiling, since the byte budget frees slots too.
+//WHERE DOES A NEW RUNG GO? The first empty slot, or a new one appended. Never -1.
 //
-//THE SCARCE RESOURCE IS THE POOL, NOT THE BUDGET, and until this existed nothing reclaimed it on
-//demand: get_evictable_slot already orders dead before live, but it is reached from exactly one
-//place, the byte-budget loop inside gpttype_save_state_kv. Bytes and slots run out
-//independently -- dead rungs are individually cheap, so the pool fills with them while the
-//budget is nowhere near binding, and the ladder simply stops advancing. Measured on omen
-//2026-09-08 over a 13-phase sweep: 9 promotions refused for "no free slot" against 11 that
-//landed, while 16 of 17 slots held DEAD rungs and all 26 budget evictions had picked victim=dead.
+//THERE IS NO SLOT POOL. An empty savestate_data costs ~150 bytes, so slot count is not a
+//resource, and it must never be what stops the ladder or what deletes a checkpoint. With a fixed
+//array it was both: bytes and slots ran out independently, dead rungs are individually cheap, so
+//the array filled while the budget sat slack - CT101 2026-09-11, 62 prefill seeds refused for
+//"1 free slot" with 32 of 33 slots held at 6680 of 32768 MB - and the only way out was reclaiming
+//dead slots on POOL pressure, deleting checkpoints the budget had room for.
 //
-//A DEAD VICTIM ONLY. Trading a live rung for a new one is not obviously a win, and genuine byte
-//pressure is already the budget loop's job.
-//
-//⚠️ EXCEPTION TO "EVICTION IS MEMORY-PRESSURE DRIVEN ONLY". This frees a slot because the POOL
-//is full, not because the byte budget is - at CT101 scale (savestate_limit = n_ctx/4096 + 1, 33
-//slots at 131k) the pool rarely binds, but where it does this deletes a checkpoint the budget had
-//room for. Left in place pending a decision; do not copy the pattern. Prefill seeding does NOT
-//call this: a seed takes a genuinely free slot or is skipped (smartcache_seed_slot).
-static int smartcache_acquire_rung_slot(const char *why)
+//The byte budget, enforced in gpttype_save_state_kv's dead-first loop, is now the ONLY thing
+//that frees a checkpoint. The array only grows; freed slots are reused before it does.
+static int smartcache_free_slot()
 {
-    int victim = get_evictable_slot(rnn_reusable_slot_idx,-1);
-    if(victim!=-1 && !smartcache_ladder_rung_live(victim))
-    {
-        printf("\n[SmartCache Ladder: reclaimed dead slot %d @ depth %zu so %s could proceed]\n",
-               victim, savestates[victim].savestate_context_tokens.size(), why);
-        free_savestate_slot(victim, true);
-        return victim;
-    }
-    int fresh = get_target_slot(rnn_reusable_slot_idx,-1);
-    if(fresh!=-1 && savestates[fresh].current_savestate_buffer.empty())
-    {
-        return fresh;
-    }
-    return -1;
-}
-
-//MAY A PREFILL SEED BE WRITTEN NOW, AND WHERE? The slot, or -1 with `why` filled in.
-//
-//A seed is speculative, so it is written only out of SLACK - it never competes with anything a
-//conversation can still resume from:
-//  - a genuinely free slot, and a second one left over for this turn's promotion. Never a
-//    reclaimed one: taking a slot off a full pool is not memory pressure.
-//  - bytes: everything held, minus the head slot (rewritten in place at prefill success), plus
-//    this seed at its exact size, plus the head's own coming write, must fit the budget once
-//    TRUE GARBAGE is freed - slots dead against both the pre-turn context and the arriving
-//    prompt. Those are the only victims get_evictable_slot offers while a seed is in flight, so
-//    passing here means the budget loop cannot be pushed into "over budget and nothing
-//    evictable", nor reach a rung anyone still owns.
-static int smartcache_seed_slot(int head_depth, size_t seed_bytes, std::string &why)
-{
-    int freeslot = -1;
-    int freecount = 0;
-    size_t garbage = 0;
     for(int i=0;i<savestate_limit;++i)
     {
         if(i==rnn_reusable_slot_idx || i==rnn_boundary_slot_idx
@@ -5986,22 +5944,39 @@ static int smartcache_seed_slot(int head_depth, size_t seed_bytes, std::string &
         }
         if(savestates[i].current_savestate_buffer.empty())
         {
-            if(freeslot==-1)
-            {
-                freeslot = i;
-            }
-            ++freecount;
+            return i;
+        }
+    }
+    savestates.emplace_back();
+    ++savestate_limit;
+    return savestate_limit - 1;
+}
+
+//MAY A PREFILL SEED BE WRITTEN NOW, AND WHERE? The slot, or -1 with `why` filled in.
+//
+//A seed is speculative, so it is written only out of SLACK - it never competes with anything a
+//conversation can still resume from. Slots are free (smartcache_free_slot grows the array), so
+//the only question is bytes: everything held, minus the head slot (rewritten in place at prefill success), plus
+//    this seed at its exact size, plus the head's own coming write, must fit the budget once
+//    TRUE GARBAGE is freed - slots dead against both the pre-turn context and the arriving
+//    prompt. Those are the only victims get_evictable_slot offers while a seed is in flight, so
+//    passing here means the budget loop cannot be pushed into "over budget and nothing
+//    evictable", nor reach a rung anyone still owns.
+static int smartcache_seed_slot(int head_depth, size_t seed_bytes, std::string &why)
+{
+    size_t garbage = 0;
+    for(int i=0;i<savestate_limit;++i)
+    {
+        if(i==rnn_reusable_slot_idx || i==rnn_boundary_slot_idx
+           || (rnn_lifeboat_hard_reserved && i==rnn_lifeboat_slot_idx)
+           || savestates[i].current_savestate_buffer.empty())
+        {
             continue;
         }
         if(i!=smartcache_protected_slot && !smartcache_ladder_rung_live(i) && !smartcache_rung_owned_this_turn(i))
         {
             garbage += savestates[i].current_savestate_size + savestates[i].current_draft_savestate_size;
         }
-    }
-    if(freecount < 2)
-    {
-        why = std::to_string(freecount) + " free slot(s); a seed needs one and leaves one for the promotion";
-        return -1;
     }
     if(smartcache_budget_bytes > 0)
     {
@@ -6022,7 +5997,7 @@ static int smartcache_seed_slot(int head_depth, size_t seed_bytes, std::string &
             return -1;
         }
     }
-    return freeslot;
+    return smartcache_free_slot();
 }
 
 //=============================================================================================
@@ -6163,18 +6138,10 @@ static int smartcache_ladder_on_prefill_success()
 
     if(headdepth > 0 && headdepth < depth && smartcache_ladder_rung_live(headslot) && smartcache_ladder_worth_writing(headdepth, depth))
     {
-        int fresh = smartcache_acquire_rung_slot("a promotion");
-        if(fresh != -1 && savestates[fresh].current_savestate_buffer.empty())
-        {
-            rnn_reusable_slot_idx = fresh;
-            printf("\n[SmartCache Ladder: promoted slot %d @ depth %d to a durable rung (gap %d, nearest rung %d back); head moves to slot %d]\n",
-                   headslot, headdepth, smartcache_ladder_gap(depth), nearest, fresh);
-        }
-        else
-        {
-            printf("\n[SmartCache Ladder: slot %d @ depth %d earned promotion but no free slot; ladder holds]\n",
-                   headslot, headdepth);
-        }
+        int fresh = smartcache_free_slot();
+        rnn_reusable_slot_idx = fresh;
+        printf("\n[SmartCache Ladder: promoted slot %d @ depth %d to a durable rung (gap %d, nearest rung %d back); head moves to slot %d]\n",
+               headslot, headdepth, smartcache_ladder_gap(depth), nearest, fresh);
     }
     else if(headdepth > 0 && !smartcache_ladder_rung_live(headslot))
     {
