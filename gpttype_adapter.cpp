@@ -7068,6 +7068,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     bool firstdecodedone = false; //we CANNOT use logits if the first decode has not been executed yet.
     bool v3_use_scratch = true; //for normal inference always use scratch
     bool rnn_lifeboat_taken = false;
+    bool rnn_ladder_head_taken = false; //the head checkpoint was taken at the prompt boundary, 32 tokens back
     const int rnn_lifeboat_target = (int)((embd_inp.size() * smartcache_rnn_lifeboat_percent) / 100);
     const bool rnn_ladder_enabled = smartcache_grid_mode && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC;
     //the ladder supersedes the lifeboat: a point every N tokens of depth is strictly denser
@@ -7197,15 +7198,41 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     int32_t decode_status = -1;
                     bool skipdecodelater = false;
 
-                    //Snapshot 32 tokens before the prefill ends (legacy non-grid mode only).
-                    if(!smartcache_grid_mode && draft_ctx==nullptr && !startedsampling && input_consumed==embd_inp.size()
-                       && embd.size()>1 && input_consumed>64)
+                    //TAKE THE TURN'S CHECKPOINT 32 TOKENS BEFORE THE PREFILL ENDS (DP-366).
+                    //
+                    //Legacy writes a dedicated boundary rung here. The ladder writes its ONE head
+                    //checkpoint here instead - this is the placement both smartcache_ladder_worth_writing
+                    //and smartcache_identical_slot_at_kv_depth are written against ("the head write fires
+                    //32 tokens before the end of the prefill"), and the only thing that was still calling
+                    //it at the prompt tip was the startedsampling site below.
+                    //
+                    //Why the boundary and not the tip: KoboldAI Lite strips the previous turn's <think>
+                    //block on every submit (strip_thinking_mode defaults to 1), so P_{N+1} = P_N +
+                    //strip(R_N) + input - P_N is a clean prefix by construction, and a generation-free
+                    //checkpoint at |P_N| absorbs the whole turn. 32 tokens back it still does, and it
+                    //additionally survives a retokenized tail. Measured on omen 2026-09-12: legacy 81
+                    //tokens off the boundary rung, ladder 15658 with no checkpoint there at all.
+                    //
+                    //There is still exactly ONE write per turn. The pair of full-depth states 32 tokens
+                    //apart - the thing the write guard exists to refuse - would be this write PLUS the
+                    //tip one, so rnn_ladder_head_taken suppresses the latter rather than adding a rung.
+                    if(draft_ctx==nullptr && !startedsampling && input_consumed==embd_inp.size()
+                       && embd.size()>1 && input_consumed>64
+                       && (rnn_ladder_enabled || !smartcache_grid_mode))
                     {
                         if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
                         {
                             if(embd.size()<=48)
                             {
-                                smartcache_quick_snapshot(rnn_boundary_slot_idx);
+                                if(rnn_ladder_enabled)
+                                {
+                                    smartcache_ladder_on_prefill_success();
+                                    rnn_ladder_head_taken = true;
+                                }
+                                else
+                                {
+                                    smartcache_quick_snapshot(rnn_boundary_slot_idx);
+                                }
                             }
                             else
                             {
@@ -7218,7 +7245,15 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                                 {
                                     if(p==parts.size()-1)
                                     {
-                                        smartcache_quick_snapshot(rnn_boundary_slot_idx);
+                                        if(rnn_ladder_enabled)
+                                        {
+                                            smartcache_ladder_on_prefill_success();
+                                            rnn_ladder_head_taken = true;
+                                        }
+                                        else
+                                        {
+                                            smartcache_quick_snapshot(rnn_boundary_slot_idx);
+                                        }
                                     }
                                     std::vector<gpt_vocab::id> chunk = parts[p];
                                     kcpp_embd_batch smallbatch = kcpp_embd_batch(chunk, temp_past, use_mrope, draft_is_mtp);
@@ -7464,7 +7499,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             if (!startedsampling)
             {
                 startedsampling = true;
-                if(rnn_ladder_enabled && current_context_tokens.size() > 32)
+                //The boundary write above is the head checkpoint whenever it fired. This is the
+                //fallback for the turns it cannot serve - a fully fast-forwarded prompt, a final
+                //batch of one, a draft model - where the tip is the only placement available.
+                if(rnn_ladder_enabled && !rnn_ladder_head_taken && current_context_tokens.size() > 32)
                 {
                     smartcache_ladder_on_prefill_success();
                 }
