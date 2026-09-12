@@ -7216,7 +7216,14 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     //There is still exactly ONE write per turn. The pair of full-depth states 32 tokens
                     //apart - the thing the write guard exists to refuse - would be this write PLUS the
                     //tip one, so rnn_ladder_head_taken suppresses the latter rather than adding a rung.
-                    if(draft_ctx==nullptr && !startedsampling && input_consumed==embd_inp.size()
+                    //
+                    //NO draft_ctx==nullptr GATE. Upstream added one (42134db6b) when this split decoded
+                    //with a bare llama_decode on the main context, which would have skipped the draft
+                    //context's prefill. Both halves now go through kcpp_decode_main_and_spec, which feeds
+                    //every draft type via common_speculative_process, and gpttype_save_state_kv already
+                    //writes the draft state alongside - the mid-prefill seed writes rely on exactly that
+                    //under --usemtp on CT101. With the gate, an MTP unit never got a boundary rung at all.
+                    if(!startedsampling && input_consumed==embd_inp.size()
                        && embd.size()>1 && input_consumed>64
                        && (rnn_ladder_enabled || !smartcache_grid_mode))
                     {
@@ -7501,7 +7508,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                 startedsampling = true;
                 //The boundary write above is the head checkpoint whenever it fired. This is the
                 //fallback for the turns it cannot serve - a fully fast-forwarded prompt, a final
-                //batch of one, a draft model - where the tip is the only placement available.
+                //batch of one - where the tip is the only placement available.
                 if(rnn_ladder_enabled && !rnn_ladder_head_taken && current_context_tokens.size() > 32)
                 {
                     smartcache_ladder_on_prefill_success();
