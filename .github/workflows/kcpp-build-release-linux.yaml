@@ -8,10 +8,10 @@ on:
         required: false
         default: ''
 
-  # fork-only (DP-326): build and deploy on push to main or deploy.
+  # fork-only (DP-326): build and deploy on push to main - what CT101 serves is main.
   # Must never be carried onto feat/* or into an upstream PR.
   push:
-    branches: [main, deploy]
+    branches: [main]
 
 # ct100 is a single self-hosted runner. Without this, a rapid series of pushes
 # queues several full builds against one box; a cancelled run's `make` children
