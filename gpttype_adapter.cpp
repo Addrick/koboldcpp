@@ -4305,7 +4305,82 @@ void ApplyPromptFormatAdjustments(std::string & added_memory, std::string & inpu
     }
 }
 
-void AppendDedicatedMemoryAndNegativePrompt(std::vector<int> & embd_inp, const std::vector<int> & embd_inp_mem, const std::vector<int> & negprompt_tokens, int n_predict, int nctx)
+//GRID-MODE FRONT TRIM (DP-371). The legacy trims below drop exactly the overflow of
+//prompt + n_predict over the REQUEST's context, every turn. Once a conversation reaches that
+//wall the cut moves by each turn's growth; a recurrent state cannot drop a prefix, so every
+//rung behind the cut is dead every turn and each continuation is a full reprocess, while a
+//retry recomputes the same cut and is cheap. Grid mode does two things instead. It reserves
+//only min(n_predict, smartcache_grid_min_reserve) up front and caps the reply to the room left
+//after the trim, so a large output slider is absorbed by the reply, not the prompt. And when
+//the story must be cut, the cut is aligned to the window the cache already holds - held there
+//while it still fits, otherwise advanced from there in whole smartcache_window_step steps,
+//never by one turn's overflow. Every rung stays live between steps; the ladder rebuilds once
+//per step of growth instead of once per turn. A pure function of the inputs, so a retry
+//recomputes the same cut.
+static const int smartcache_grid_min_reserve = 4096; //reply room a trim must leave; a thinking model needs this much to say anything
+static const int smartcache_window_step = 16384;     //a moved window advances by whole steps of this
+static const int smartcache_window_needle = 32;      //cache tokens matched against the story to find the previous cut
+
+//How many leading tokens of `story` to drop so that at most nctx - reserve remain. The cache's
+//copy of the story window begins at current_context_tokens[cache_start] and is
+//story[cut + story_skip]: the bare-prompt path substitutes BOS for the token at its cut, so it
+//passes cache_start=1, story_skip=1; the memory path keeps the story intact behind the memory
+//block, so it passes the story's position in the cache and story_skip=0.
+static int smartcache_window_cut(const std::vector<int> & story, int reserve, int nctx, int cache_start, int story_skip)
+{
+    const int size = (int)story.size();
+    const int need = size + reserve - nctx;
+    if(need <= 0)
+    {
+        return 0;
+    }
+    int aligned = -1;
+    const int needle = smartcache_window_needle;
+    if(cache_start >= 0 && (int)current_context_tokens.size() >= cache_start + needle)
+    {
+        auto hit = std::search(story.begin(), story.end(),
+                               current_context_tokens.begin() + cache_start,
+                               current_context_tokens.begin() + cache_start + needle);
+        if(hit != story.end() && (int)(hit - story.begin()) >= story_skip)
+        {
+            aligned = (int)(hit - story.begin()) - story_skip;
+        }
+    }
+    if(aligned >= need)
+    {
+        printf("\n[SmartCache Window: cut held @ %d (%d + %d reserve <= %d)]\n", aligned, size - aligned, reserve, nctx);
+        return aligned;
+    }
+    //The window must move: advance from where it was in whole steps. A step is capped at half
+    //the room so a small context never loses more than half its window at once.
+    const int room = nctx - reserve;
+    int step = smartcache_window_step;
+    if(step > room / 2)
+    {
+        step = room / 2;
+    }
+    if(step < 1)
+    {
+        step = 1;
+    }
+    const int base = (aligned >= 0 ? aligned : 0);
+    int offset = base + ((need - base + step - 1) / step) * step;
+    if(offset > size)
+    {
+        offset = size;
+    }
+    if(aligned >= 0)
+    {
+        printf("\n[SmartCache Window: cut %d -> %d (step %d, need %d); ladder rebuilds]\n", aligned, offset, step, need);
+    }
+    else
+    {
+        printf("\n[SmartCache Window: no cache alignment, cut @ %d (quantized)]\n", offset);
+    }
+    return offset;
+}
+
+void AppendDedicatedMemoryAndNegativePrompt(std::vector<int> & embd_inp, const std::vector<int> & embd_inp_mem, const std::vector<int> & negprompt_tokens, int n_predict, int nctx, bool grid_window)
 {
     //added special memory, overwrite if needed
     if (embd_inp_mem.size() + negprompt_tokens.size() > 0)
@@ -4338,6 +4413,17 @@ void AppendDedicatedMemoryAndNegativePrompt(std::vector<int> & embd_inp, const s
         if(totalsize > nctx)
         {
             int excess = totalsize - nctx;
+            if(grid_window)
+            {
+                //where the story sits in the cache: behind the memory block, and behind the
+                //BOS this function puts in front when the memory does not already start with one
+                int story_at = embd_inp_mem_copy.size();
+                if(add_bos_token && bos.size()>0 && (embd_inp_mem_copy.empty() || bos[0]!=embd_inp_mem_copy[0]))
+                {
+                    story_at += 1;
+                }
+                excess = smartcache_window_cut(embd_inp, addmemtokens + n_predict, nctx, story_at, 0);
+            }
             if (embd_inp.size() >= excess) {
                 embd_inp.erase(embd_inp.begin(), embd_inp.begin() + excess);
             } else {
@@ -4825,7 +4911,7 @@ static bool batch_claim_waiting_locked()
         }
 
         int n_ctx = req->max_context_length > 0 ? std::min(req->max_context_length, kcpp_data->n_ctx) : kcpp_data->n_ctx;
-        AppendDedicatedMemoryAndNegativePrompt(req->prompt_tokens, added_memory_tokens, std::vector<llama_token>(), req->max_length, n_ctx);
+        AppendDedicatedMemoryAndNegativePrompt(req->prompt_tokens, added_memory_tokens, std::vector<llama_token>(), req->max_length, n_ctx, false);
 
         if(req->max_length > 0 && (int) req->prompt_tokens.size() + req->max_length > n_ctx)
         {
@@ -6641,13 +6727,18 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         TokenizeString(addedmemory, embd_inp_mem, file_format, add_bos_token);
     }
 
+    //grid mode reserves only what a reply needs to say anything and caps the reply to the
+    //room left after the trims - see smartcache_window_cut. Legacy reserves the whole n_predict.
+    const int trim_reserve = (smartcache_grid_mode ? std::min(kcpp_data->n_predict, smartcache_grid_min_reserve) : kcpp_data->n_predict);
+
     //truncate to front of the prompt if its too long
-    if (embd_inp.size() + kcpp_data->n_predict > nctx)
+    if (embd_inp.size() + trim_reserve > nctx)
     {
         //get bos token
         std::vector<int> bos;
         TokenizeString("", bos, file_format, add_bos_token);
-        int offset = embd_inp.size() - nctx + kcpp_data->n_predict;
+        int offset = (smartcache_grid_mode ? smartcache_window_cut(embd_inp, trim_reserve, nctx, 1, 1)
+                                           : (int)embd_inp.size() - nctx + trim_reserve);
         offset = kcpp_adjust_media_truncation_start(embd_inp, offset);
         embd_inp = std::vector<int>(embd_inp.begin() + offset, embd_inp.end());
         //replace bos into front if exists
@@ -6659,7 +6750,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
 
     if(last_media_mem.size()>0 && !media_inserted_inline) //stick the media placeholders before the added mem if no inline placeholders were found
     {
-        if(last_media_mem.size() + kcpp_data->n_predict + 4 > nctx)
+        if(last_media_mem.size() + trim_reserve + 4 > nctx)
         {
             printf("\nWarning: Too many multimodal tokens, max context exceeded! They will be ignored!\n");
         }
@@ -6682,9 +6773,9 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
             }
 
              //shorten memory if needed
-            if (embd_inp_mem.size() + kcpp_data->n_predict + 4 > nctx)
+            if (embd_inp_mem.size() + trim_reserve + 4 > nctx)
             {
-                int limit = nctx - (kcpp_data->n_predict + 4);
+                int limit = nctx - (trim_reserve + 4);
                 if (embd_inp_mem.size() > limit) {
                     embd_inp_mem.resize(limit);
                 }
@@ -6704,7 +6795,19 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         }
     }
 
-    AppendDedicatedMemoryAndNegativePrompt(embd_inp, embd_inp_mem, negprompt_tokens, kcpp_data->n_predict, nctx);
+    AppendDedicatedMemoryAndNegativePrompt(embd_inp, embd_inp_mem, negprompt_tokens, trim_reserve, nctx, smartcache_grid_mode);
+
+    //grid mode: the reply, not the prompt, absorbs a large output slider
+    if(smartcache_grid_mode && (int)embd_inp.size() + kcpp_data->n_predict > nctx)
+    {
+        int room = nctx - (int)embd_inp.size();
+        if(room < 1)
+        {
+            room = 1;
+        }
+        printf("\n[SmartCache Window: reply capped %d -> %d (%d prompt of %d)]\n", kcpp_data->n_predict, room, (int)embd_inp.size(), nctx);
+        kcpp_data->n_predict = room;
+    }
 
     //prepare negative prompt
     if(guidance_ctx && negprompt_tokens.size()>0 && inputs.guidance_scale!=1.0f)
