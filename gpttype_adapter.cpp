@@ -6404,8 +6404,17 @@ static int smartcache_ladder_on_prefill_success()
     }
     else if(headdepth > 0 && !smartcache_ladder_rung_live(headslot))
     {
-        printf("\n[SmartCache Ladder: head slot %d @ depth %d is dead relative to current context; overwriting rather than promoting]\n",
-               headslot, headdepth);
+        //A DEAD HEAD IS KEPT, NOT OVERWRITTEN (DP-378). Dead here means another conversation
+        //arrived, or this one was edited - and in both cases the old head is exactly what a
+        //switch back or an undo resumes from, at 32 tokens instead of a turn. Overwriting it
+        //deleted a checkpoint the budget had room for; like every other dead rung it now waits
+        //for gpttype_save_state_kv's dead-first loop to spend it when a write needs the bytes.
+        //Best effort only: the plan does not see dead rungs, so under pressure it goes first.
+        //Real multi-conversation retention is the later dual-slot design.
+        int fresh = smartcache_free_slot();
+        rnn_reusable_slot_idx = fresh;
+        printf("\n[SmartCache Ladder: head slot %d @ depth %d is dead relative to current context; kept as a dead rung, head moves to slot %d]\n",
+               headslot, headdepth, fresh);
     }
 
     gpttype_save_state_kv(rnn_reusable_slot_idx);
