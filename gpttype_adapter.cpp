@@ -4351,16 +4351,48 @@ static int smartcache_window_cut(const std::vector<int> & story, int reserve, in
     {
         return 0;
     }
+    //The needle alone is not an alignment: repeated text (boilerplate, code, pasted logs) puts
+    //the same 32 tokens at several places in the story, and taking the first hit sends the cut
+    //back to near 0, forcing a full reprocess the turn after every step (DP-373). Every hit is
+    //scored by how far the story keeps matching the cache from there; the longest run is where
+    //the cache's window actually sits, ties keeping the earliest. A run that reaches the end of
+    //the cache or of the story cannot be beaten, so the scan stops there. Periodic text could
+    //make the scoring quadratic, so it is bounded to a few passes over the story; past that
+    //the best run so far stands.
     int aligned = -1;
     const int needle = smartcache_window_needle;
-    if(cache_start >= 0 && (int)current_context_tokens.size() >= cache_start + needle)
+    const int cache_len = (int)current_context_tokens.size() - cache_start;
+    if(cache_start >= 0 && cache_len >= needle)
     {
-        auto hit = std::search(story.begin(), story.end(),
-                               current_context_tokens.begin() + cache_start,
-                               current_context_tokens.begin() + cache_start + needle);
-        if(hit != story.end() && (int)(hit - story.begin()) >= story_skip)
+        const auto cache_begin = current_context_tokens.begin() + cache_start;
+        int best_run = 0;
+        long long budget = 8LL * size;
+        auto from = story.begin() + std::min(story_skip, size);
+        while(budget > 0)
         {
-            aligned = (int)(hit - story.begin()) - story_skip;
+            auto hit = std::search(from, story.end(), cache_begin, cache_begin + needle);
+            if(hit == story.end())
+            {
+                break;
+            }
+            const int at = (int)(hit - story.begin());
+            const int limit = std::min(cache_len, size - at);
+            int run = needle;
+            while(run < limit && story[at + run] == cache_begin[run])
+            {
+                ++run;
+            }
+            budget -= run;
+            if(run > best_run)
+            {
+                best_run = run;
+                aligned = at - story_skip;
+            }
+            if(run == limit)
+            {
+                break;
+            }
+            from = hit + 1;
         }
     }
     if(aligned >= need)
