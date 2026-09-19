@@ -7513,8 +7513,17 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     //every draft type via common_speculative_process, and gpttype_save_state_kv already
                     //writes the draft state alongside - the mid-prefill seed writes rely on exactly that
                     //under --usemtp on CT101. With the gate, an MTP unit never got a boundary rung at all.
+                    //
+                    //THE LADDER GATES ON PROMPT DEPTH, NOT ON INPUT (DP-376). ContextFastForward erases
+                    //the matched prefix from embd_inp, so input_consumed is only the unmatched tail. A
+                    //retry's tail is the 32 tokens after the head, so `input_consumed>64` skipped this
+                    //write and the startedsampling fallback wrote a new head at the tip instead,
+                    //promoting the P-32 head beside it: two full-depth states 31 tokens apart, on a
+                    //turn that must write nothing. Gated on depth, the write lands at P-32, finds the
+                    //head already there and only touches it. Legacy keeps upstream's gate.
                     if(!startedsampling && input_consumed==embd_inp.size()
-                       && embd.size()>1 && input_consumed>64
+                       && embd.size()>1
+                       && (rnn_ladder_enabled ? (n_past + (int)embd.size()) > 64 : input_consumed > 64)
                        && (rnn_ladder_enabled || !smartcache_grid_mode))
                     {
                         if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
