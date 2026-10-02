@@ -186,6 +186,7 @@ static int smartcache_protected_slot = -1; //a slot the byte budget must not evi
 //two let eviction ask the question against the context the turn arrived over as well.
 static std::vector<gpt_vocab::id> smartcache_pre_turn_tokens; //the cache's context when this turn arrived
 static std::vector<gpt_vocab::id> smartcache_arriving_tokens; //the whole prompt this turn is ingesting
+static bool smartcache_context_skipped = false; //the live context belongs to a request that skipped smartcache
 static std::string overridden_jinja_template = ""; //if set, overrides jinja template
 
 static int delayed_generated_tokens_limit = 0;
@@ -6465,9 +6466,25 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     dry_max_token_repeat.clear();
     top_picks_history.clear();
     early_abort = false;
+    //SMARTCACHE SKIP (DP-358). A one-shot batch request - a prompt nothing will ever resend or
+    //continue - has no use for a checkpoint, and writing one costs the conversation sharing this
+    //server: every write is budgeted, and from a foreign prompt's context the idle conversation's
+    //rungs are all dead, so they are what the budget spends - deepest first. A request carrying
+    //smartcache_skip is outside the cache entirely: no load, no write, no eviction, no bookkeeping.
+    const bool smartcache_on = kcpp_data->smartcache && !inputs.smartcache_skip;
+    if(kcpp_data->smartcache && inputs.smartcache_skip)
+    {
+        printf("\n[SmartCache: skipped for this request]\n");
+    }
     if(smartcache_grid_mode)
     {
-        smartcache_pre_turn_tokens = current_context_tokens; //before any swap-load or fast-forward touches it
+        //A skipped request leaves a context no rung belongs to. The turn after it is judged against
+        //the context the skip arrived over, or it would prune every turn boundary as text that is gone.
+        if(!smartcache_context_skipped)
+        {
+            smartcache_pre_turn_tokens = current_context_tokens; //before any swap-load or fast-forward touches it
+        }
+        smartcache_context_skipped = inputs.smartcache_skip;
         smartcache_arriving_tokens.clear();
         smartcache_turn_save_seconds = 0.0;
         smartcache_turn_head_depth = -1;
@@ -7021,7 +7038,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     bool blank_prompt = (addedmemory=="" && kcpp_data->prompt=="");
 
     //smart cache logic
-    if(kcpp_data->smartcache && file_format==FileFormat::GGUF_GENERIC)
+    if(smartcache_on && file_format==FileFormat::GGUF_GENERIC)
     {
         bool shiftable = true;
         if(!kcpp_data->use_contextshift || is_recurrent)
@@ -7358,10 +7375,10 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     bool rnn_lifeboat_taken = false;
     bool rnn_ladder_head_taken = false; //the head checkpoint was taken at the prompt boundary, 32 tokens back
     const int rnn_lifeboat_target = (int)((embd_inp.size() * smartcache_rnn_lifeboat_percent) / 100);
-    const bool rnn_ladder_enabled = smartcache_grid_mode && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC;
+    const bool rnn_ladder_enabled = smartcache_grid_mode && smartcache_on && is_recurrent && file_format==FileFormat::GGUF_GENERIC;
     //the ladder supersedes the lifeboat: a point every N tokens of depth is strictly denser
     //than the single 65%-of-this-prompt point, and does not move when the prompt does.
-    const bool rnn_lifeboat_enabled = !rnn_ladder_enabled && kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && (int)embd_inp.size() >= smartcache_rnn_lifeboat_min_prompt_tokens;
+    const bool rnn_lifeboat_enabled = !rnn_ladder_enabled && smartcache_on && is_recurrent && file_format==FileFormat::GGUF_GENERIC && (int)embd_inp.size() >= smartcache_rnn_lifeboat_min_prompt_tokens;
 
     speculative_draft_result draft_results; //only use if drafting was used
     bool draft_used = false;
@@ -7535,7 +7552,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                        && (rnn_ladder_enabled ? (n_past + (int)embd.size()) > 64 : input_consumed > 64)
                        && (rnn_ladder_enabled || !smartcache_grid_mode))
                     {
-                        if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
+                        if(smartcache_on && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
                         {
                             if(embd.size()<=48)
                             {
@@ -8417,7 +8434,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
         delayed_generated_tokens.pop_front();
     }
 
-    if(kcpp_data->smartcache && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
+    if(smartcache_on && is_recurrent && file_format==FileFormat::GGUF_GENERIC && current_context_tokens.size() > 32)
     {
         if(rnn_ladder_enabled)
         {
