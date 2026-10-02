@@ -6474,9 +6474,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
     const bool smartcache_on = kcpp_data->smartcache && !inputs.smartcache_skip;
     if(kcpp_data->smartcache && inputs.smartcache_skip)
     {
-        printf("
-[SmartCache: skipped for this request]
-");
+        printf("\n[SmartCache: skipped for this request]\n");
     }
     if(smartcache_grid_mode)
     {
