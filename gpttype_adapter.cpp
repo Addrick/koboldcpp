@@ -7490,7 +7490,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs)
                     }
                     guidance_n_past += 1;
                 }
-                if(embd.size()!=1 || draft_ctx==nullptr || draft_spec==nullptr || remaining_tokens<=1 || grammar!=nullptr || startedsampling==false) //for large batch, or if no draft model, PP/TG as usual
+                if(embd.size()!=1 || draft_ctx==nullptr || draft_spec==nullptr || remaining_tokens<=1 || startedsampling==false) //for large batch, or if no draft model, PP/TG as usual
                 {
                     draft_used = false;
                     kcpp_embd_batch batch = kcpp_embd_batch(embd, n_past, use_mrope, draft_is_mtp);
